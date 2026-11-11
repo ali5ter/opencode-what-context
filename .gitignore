@@ -1,0 +1,9 @@
+# AI context (kept locally; may move to the private ai-context repo with a symlink)
+AGENTS.md
+AGENTS.md.backup.*
+CLAUDE.md
+CLAUDE.md.backup.*
+
+# TypeScript
+node_modules/
+dist/
