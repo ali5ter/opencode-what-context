@@ -1,4 +1,4 @@
-# opencode-context-usage
+# opencode-what-context
 
 A plugin for [OpenCode](https://opencode.ai) that shows what was sent to the model, request by
 request.
@@ -13,7 +13,7 @@ panel in the TUI: a per-request composition chart, a request history, and a cont
 ## Why
 
 OpenCode persists per-message token and cost totals in its SQLite session database, but not the
-served request body. A community plugin of the same name —
+served request body. A community `/context` plugin —
 [`opencode-context-usage`](https://github.com/angeloper86/opencode-context-usage) by angeloper86 —
 answers *how many*: token totals by category, cache hit rate, cost, including delegated subagents.
 Nothing answers *what*: the served request body is not persisted, so the composition of the context
