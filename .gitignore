@@ -11,3 +11,6 @@ CLAUDE.md.backup.*
 # TypeScript
 node_modules/
 dist/
+
+# Reference tokenizer download (research, part B of scripts/measure.ts)
+.tokenizer-cache/

@@ -1,22 +1,33 @@
 /**
- * opencode-what-context — build step 1: seam prototype.
+ * opencode-what-context — build step 2: per-call records.
  *
- * Registers the `context`, `http.request`, and `http.response` session hooks and records
- * each fired event's shape into plugin storage (`ctx.storage`).
+ * Joins the three session hooks into one record per model call, stored at
+ * `wc/call/<sessionID>/<seq>` in plugin storage:
  *
- * Redaction policy: conversation content is never persisted — known conversation parts
- * (message text, reasoning, tool input and results) are reduced to byte counts. Long
- * strings elsewhere keep only a short sample so parts can be identified; strings at or
- * under a short length are structural and are kept verbatim. Credential headers are
- * redacted.
+ * - `context` (primary calls only) supplies the composition: per-source system parts,
+ *   per-part messages, and per-tool schema sizes, each with raw UTF-8 bytes and
+ *   JSON-rendered bytes (the bytes the wire body spends on that part).
+ * - `http.request` supplies the wire body size (overhead cross-check) and consumes the
+ *   pending composition. Pairing is by session plus fire-time ordering — a pending
+ *   composition queue per session, consumed by the next `primary` request — never by
+ *   per-hook sequence numbers (which drift when title/compaction calls fire).
+ * - `http.response` supplies provider-reported usage, normalized to the DB token shape
+ *   `{input, output, reasoning, cache: {read, write}}`.
  *
- * Dumps are stored under `wc/<hook>/<sessionID>/<seq>` and each store is logged to the
- * server console.
+ * Pairing detail: the response event carries the same `Request` object the request
+ * event received, so the response is matched to its in-flight record by object
+ * identity, with per-kind FIFO as fallback.
+ *
+ * Redaction policy: conversation content is reduced to byte counts with a short
+ * sample per part. Full texts (and the full wire body) are persisted only when the
+ * `WC_FULL=1` environment variable is set — an explicit research mode for measuring
+ * per-part token ground truth; delete those records after measuring.
  *
  * Author: Alister Lewis-Bowen <alister@lewis-bowen.org>
  */
 
 import { Plugin } from "@opencode/plugin"
+import type { StorageEntry } from "@opencode/plugin"
 import type {
   SessionContext,
   SessionHttpRequest,
@@ -26,23 +37,24 @@ import type {
 /** A JSON-safe value, structurally compatible with `Schema.Json`. */
 type Shape = null | boolean | number | string | Shape[] | { [key: string]: Shape }
 
-/** Strings at or under this length are treated as structural and kept verbatim. */
-const SHORT = 120
+/** The plugin storage value type. */
+type Json = StorageEntry["value"]
 
-/** Sample length kept for longer strings under soft redaction. */
+/** Strings longer than this get a sample; shorter strings may be kept verbatim in FULL mode. */
 const SAMPLE = 48
 
-/** Maximum recursion depth of the shape walker. */
-const MAX_DEPTH = 4
+/** Pending compositions older than this are dropped as stale (the request never dispatched). */
+const STALE_MS = 60_000
 
-/** Maximum number of array elements described; the rest is counted. */
-const MAX_ITEMS = 20
+/** In-flight requests older than this are marked orphan (no response arrived). */
+const ORPHAN_MS = 120_000
 
-/** Maximum number of object keys described; the rest is counted. */
-const MAX_KEYS = 30
+/** The runtime's environment variables, without requiring Node type definitions. */
+const env: Record<string, string | undefined> =
+  (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env ?? {}
 
-/** Maximum number of tools described in the context hook's tool map. */
-const MAX_TOOLS = 40
+/** Research mode: persist full texts and the wire body. Off by default. */
+const FULL = env["WC_FULL"] === "1"
 
 const encoder = new TextEncoder()
 
@@ -57,6 +69,21 @@ function utf8(text: string): number {
 }
 
 /**
+ * JSON-rendered byte length: the bytes this value occupies inside a JSON body,
+ * i.e. the UTF-8 length of its JSON serialization (strings include the quotes).
+ *
+ * @param value - The value to measure.
+ * @returns The number of UTF-8 bytes of the JSON serialization.
+ */
+function rendered(value: unknown): number {
+  try {
+    return utf8(JSON.stringify(value) ?? "null")
+  } catch {
+    return -1
+  }
+}
+
+/**
  * Coerce a value to a string, treating non-strings as empty.
  *
  * @param value - The value to coerce.
@@ -66,238 +93,326 @@ function str(value: unknown): string {
   return typeof value === "string" ? value : ""
 }
 
-/** Redaction mode: soft keeps a short sample of long strings; hard keeps only the byte count. */
-type Redaction = "soft" | "hard"
-
 /**
- * Describe a string under the given redaction mode.
+ * Short sample of a string, for identifying parts without persisting their content.
  *
- * @param text - The string to describe.
- * @param redaction - The redaction mode to apply to long strings.
- * @returns The string itself when short, otherwise a byte-count (and sample) record.
+ * @param text - The string to sample.
+ * @returns Up to `SAMPLE` leading characters, or null for empty strings.
  */
-function describeString(text: string, redaction: Redaction): Shape {
-  if (text.length <= SHORT) return text
-  if (redaction === "hard") return { __redacted: true, bytes: utf8(text) }
-  return { bytes: utf8(text), sample: text.slice(0, SAMPLE) }
+function sample(text: string): string | null {
+  return text.length === 0 ? null : text.slice(0, SAMPLE)
+}
+
+/** Per-source breakdown of the instructions system part. */
+interface SourceShape {
+  key: string
+  bytes: number
+  rendered: number
+  sample: string | null
+  text?: string
+}
+
+/** One system part of the request. */
+interface SystemShape {
+  bytes: number
+  rendered: number
+  sample: string | null
+  sources?: SourceShape[]
+  text?: string
+}
+
+/** One content part of one message. */
+interface PartShape {
+  type: string
+  bytes: number
+  rendered: number
+  sample: string | null
+  tool?: string
+  text?: string
+}
+
+/** One message of the conversation. */
+interface MessageShape {
+  role: string
+  parts: PartShape[]
+}
+
+/** One tool entry of the request. */
+interface ToolShape {
+  name: string
+  descBytes: number
+  descRendered: number
+  schemaBytes: number
+  schemaRendered: number
+  description?: string
+  schema?: unknown
+}
+
+/** The per-call composition, from the `context` event (primary calls only). */
+interface CompositionShape {
+  system: SystemShape[]
+  messages: MessageShape[]
+  tools: ToolShape[]
+  totals: {
+    systemBytes: number
+    systemRendered: number
+    contentBytes: number
+    contentRendered: number
+    toolsBytes: number
+    toolsRendered: number
+  }
+}
+
+/** Provider-reported usage, raw as delivered in the final response frame. */
+interface UsageShape {
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+  [key: string]: Shape | undefined
+}
+
+/** Normalized to the DB `session_message.data.tokens` shape. */
+interface TokensShape {
+  input: number
+  output: number
+  reasoning: number
+  cache: { read: number; write: number }
+}
+
+/** The stored per-call record. */
+interface CallRecord {
+  v: 2
+  full: boolean
+  kind: string
+  sessionID: string
+  agent: string
+  model: { id: string; providerID: string; variant?: string }
+  request: {
+    time: string
+    url: string
+    method: string
+    bodyBytes: number | null
+    body?: string
+  }
+  composition: CompositionShape | null
+  overhead: {
+    bodyBytes: number | null
+    compositionRendered: number | null
+    delta: number | null
+  }
+  response: {
+    time: string
+    status: number
+    usage: UsageShape | null
+    body?: string
+  } | null
+  tokens: TokensShape | null
+  orphan?: boolean
 }
 
 /**
- * Recursively describe an untrusted value for storage.
+ * Build the composition snapshot from a `context` event.
  *
- * @param value - The value to describe.
- * @param redaction - The redaction mode applied to long strings.
- * @param depth - Remaining recursion depth.
- * @param seen - Object identities already visited, for cycle detection.
- * @returns A JSON-safe description of `value`.
+ * @param event - The context event as fired by OpenCode.
+ * @returns The per-part composition with raw and JSON-rendered byte counts.
  */
-function describe(value: unknown, redaction: Redaction, depth: number, seen: Set<object>): Shape {
-  if (value === null || value === undefined) return null
-  if (typeof value === "number" || typeof value === "boolean") return value
-  if (typeof value === "string") return describeString(value, redaction)
-  if (typeof value === "bigint") return value.toString()
-  if (typeof value === "function" || typeof value === "symbol") return { __kind: typeof value }
-  if (value instanceof Uint8Array) return { __kind: "bytes", bytes: value.length }
-  if (value instanceof ReadableStream) return { __kind: "stream" }
-  if (seen.has(value as object)) return { __kind: "circular" }
-  if (depth <= 0) return { __kind: "truncated" }
-  seen.add(value as object)
-  if (Array.isArray(value)) {
-    const items = value.slice(0, MAX_ITEMS).map((item) => describe(item, redaction, depth - 1, seen))
-    if (value.length > MAX_ITEMS) items.push({ __omitted: value.length - MAX_ITEMS })
-    return items
-  }
-  const object = value as Record<string, unknown>
-  const keys = Object.keys(object)
-  const out: { [key: string]: Shape } = {}
-  for (const key of keys.slice(0, MAX_KEYS)) {
-    out[key] = describe(object[key], redaction, depth - 1, seen)
-  }
-  if (keys.length > MAX_KEYS) out.__omittedKeys = keys.length - MAX_KEYS
-  return out
-}
-
-/** Header names whose values must never be persisted. */
-const secretHeader = /^(authorization|proxy-authorization|api-key|x-api-key|cookie|set-cookie|x-forwarded-[a-z-]+)$/i
-
-/**
- * Describe request or response headers, redacting credentials.
- *
- * @param headers - The headers to describe.
- * @returns A record of header name to value, with secret values replaced.
- */
-function describeHeaders(headers: Headers): Shape {
-  const out: { [key: string]: Shape } = {}
-  for (const [name, value] of headers.entries()) {
-    out[name] = secretHeader.test(name) ? "__redacted__" : value
-  }
-  return out
-}
-
-/**
- * Describe the instructions part's per-source list, sampled so sources can be told apart.
- *
- * @param metadata - The system part's metadata, if any.
- * @returns One record per instruction source, or null when absent.
- */
-function describeInstructions(metadata: unknown): Shape {
-  const experimental = (metadata ?? {}) as {
+function composeSystemPart(part: unknown): SystemShape {
+  const p = part as Record<string, unknown>
+  const text = str(p["text"])
+  const out: SystemShape = { bytes: utf8(text), rendered: rendered(text), sample: sample(text) }
+  if (FULL) out.text = text
+  const experimental = (p["metadata"] ?? {}) as {
     experimental?: { instructions?: Array<{ key: string; text: string }> }
   }
   const sources = experimental.experimental?.instructions
-  if (!Array.isArray(sources)) return null
-  return sources.map((source) => ({
-    key: source.key,
-    bytes: utf8(source.text),
-    sample: source.text.slice(0, SAMPLE),
-  }))
-}
-
-/**
- * Describe one system part.
- *
- * @param part - The system part as fired by OpenCode.
- * @returns The redacted shape of the part.
- */
-function describeSystemPart(part: unknown): Shape {
-  const p = part as Record<string, unknown>
-  const text = str(p["text"])
-  return {
-    type: str(p["type"]) || "unknown",
-    bytes: utf8(text),
-    sample: text.slice(0, SAMPLE),
-    cache: p["cache"] !== undefined ? describe(p["cache"], "soft", 2, new Set()) : null,
-    instructions: describeInstructions(p["metadata"]),
+  if (Array.isArray(sources)) {
+    out.sources = sources.map((source) => {
+      const shape: SourceShape = {
+        key: str(source.key),
+        bytes: utf8(source.text),
+        rendered: rendered(source.text),
+        sample: sample(source.text),
+      }
+      if (FULL) shape.text = source.text
+      return shape
+    })
   }
+  return out
 }
 
 /**
- * Describe one message content part. Conversation content is reduced to byte counts;
- * structural fields are kept.
+ * Describe one message content part.
  *
  * @param part - The content part as fired by OpenCode.
- * @returns The redacted shape of the part.
+ * @returns The part's type with raw and JSON-rendered byte counts.
  */
-function describeContentPart(part: unknown): Shape {
+function composePart(part: unknown): PartShape {
   const p = part as Record<string, unknown>
   const type = str(p["type"])
-  if (type === "text") return { type, bytes: utf8(str(p["text"])) }
-  if (type === "reasoning") {
-    return {
-      type,
-      bytes: utf8(str(p["text"])),
-      encryptedBytes: typeof p["encrypted"] === "string" ? utf8(str(p["encrypted"])) : null,
+  let bytes = 0
+  let renderedBytes = 0
+  let sampleText: string | null = null
+  let text: string | null = null
+  let tool: string | null = null
+  switch (type) {
+    case "text":
+    case "reasoning":
+    case "compaction": {
+      text = str(p["text"])
+      bytes = utf8(text)
+      renderedBytes = rendered(text)
+      sampleText = sample(text)
+      break
+    }
+    case "tool-call": {
+      tool = str(p["name"]) || null
+      const input = p["input"]
+      bytes = rendered(input ?? null)
+      renderedBytes = bytes
+      break
+    }
+    case "tool-result": {
+      tool = str(p["name"]) || null
+      const result = (p["result"] ?? {}) as Record<string, unknown>
+      bytes = rendered(result["value"] ?? null)
+      renderedBytes = bytes
+      break
+    }
+    case "media": {
+      const media = p["media"] as
+        | { source?: { type?: string; data?: Uint8Array | string; url?: string } }
+        | undefined
+      const source = media?.source
+      if (source?.type === "base64" && typeof source.data === "string") {
+        bytes = source.data.length
+        renderedBytes = rendered(source.data)
+      } else if (source?.type === "bytes" && source.data instanceof Uint8Array) {
+        bytes = source.data.length
+        renderedBytes = bytes
+      } else if (source?.type === "url" && typeof source.url === "string") {
+        bytes = utf8(source.url)
+        renderedBytes = rendered(source.url)
+      } else {
+        bytes = -1
+        renderedBytes = -1
+      }
+      break
+    }
+    default: {
+      // Unknown part type (e.g. `effort`): measure the whole serialized part so
+      // nothing is silently unaccounted for.
+      bytes = rendered(p)
+      renderedBytes = bytes
     }
   }
-  if (type === "tool-call") {
-    return {
-      type,
-      id: str(p["id"]) || null,
-      tool: str(p["name"]) || null,
-      namespace: typeof p["namespace"] === "string" ? p["namespace"] : null,
-      inputBytes: utf8(JSON.stringify(p["input"] ?? null)),
-      providerExecuted: p["providerExecuted"] === true ? true : null,
-    }
-  }
-  if (type === "tool-result") {
-    const result = (p["result"] ?? {}) as Record<string, unknown>
-    return {
-      type,
-      id: str(p["id"]) || null,
-      tool: str(p["name"]) || null,
-      resultType: str(result["type"]) || null,
-      resultBytes: utf8(JSON.stringify(result["value"] ?? null)),
-    }
-  }
-  if (type === "media") {
-    return { type, filename: str(p["filename"]) || null, media: describe(p["media"], "hard", 2, new Set()) }
-  }
-  if (type === "compaction") {
-    return {
-      type,
-      provider: str(p["provider"]) || null,
-      textBytes: utf8(str(p["text"])),
-      hasSummary: p["text"] !== null,
-    }
-  }
-  return { type: type || "unknown", shape: describe(part, "hard", 2, new Set()) }
+  const out: PartShape = { type: type || "unknown", bytes, rendered: renderedBytes, sample: sampleText }
+  if (tool) out.tool = tool
+  if (FULL && text !== null) out.text = text
+  return out
 }
 
 /**
- * Describe one message.
+ * Build the per-message shapes.
  *
- * @param message - The message as fired by OpenCode.
- * @returns The redacted shape of the message.
+ * @param messages - The messages array as fired by OpenCode.
+ * @returns One shape per message, with one shape per content part.
  */
-function describeMessage(message: unknown): Shape {
-  const m = message as Record<string, unknown>
-  const content = Array.isArray(m["content"]) ? m["content"] : []
-  return {
-    role: str(m["role"]) || "unknown",
-    id: typeof m["id"] === "string" ? m["id"] : null,
-    content: content.map((part) => describeContentPart(part)),
-  }
+function composeMessages(messages: unknown): MessageShape[] {
+  if (!Array.isArray(messages)) return []
+  return messages.map((raw) => {
+    const m = raw as Record<string, unknown>
+    const content = Array.isArray(m["content"]) ? m["content"] : []
+    return {
+      role: str(m["role"]) || "unknown",
+      parts: content.map(composePart),
+    }
+  })
 }
 
 /**
- * Describe the context hook's tool map: per tool, description and schema sizes.
+ * Build the per-tool shapes.
  *
  * @param tools - The tools record as fired by OpenCode.
- * @returns The redacted shape of the tool map.
+ * @returns One shape per tool: description and schema sizes.
  */
-function describeTools(tools: Record<string, { description: string; input: unknown }>): Shape {
-  const entries = Object.entries(tools)
-  const out: { [key: string]: Shape } = {}
-  for (const [name, tool] of entries.slice(0, MAX_TOOLS)) {
-    out[name] = {
-      descriptionBytes: utf8(tool.description ?? ""),
-      descriptionSample: (tool.description ?? "").slice(0, SAMPLE),
-      schemaBytes: utf8(JSON.stringify(tool.input ?? null)),
+function composeTools(tools: Record<string, { description: string; input: unknown }>): ToolShape[] {
+  return Object.entries(tools).map(([name, tool]) => {
+    const description = tool.description ?? ""
+    const schema = tool.input ?? null
+    const out: ToolShape = {
+      name,
+      descBytes: utf8(description),
+      descRendered: rendered(description),
+      schemaBytes: rendered(schema),
+      schemaRendered: rendered(schema),
     }
-  }
-  if (entries.length > MAX_TOOLS) out.__omitted = entries.length - MAX_TOOLS
-  return { count: entries.length, tools: out }
+    if (FULL) {
+      out.description = description
+      out.schema = schema
+    }
+    return out
+  })
 }
 
 /**
- * Describe a `context` hook event: assembled system parts, messages, tools, and options.
+ * Build the full composition snapshot for a `context` event.
  *
  * @param event - The context event as fired by OpenCode.
- * @returns The redacted shape of the event.
+ * @returns The composition with per-part byte counts and totals.
  */
-function describeContext(event: SessionContext): Shape {
+function compose(event: SessionContext): CompositionShape {
+  const system = event.system.map(composeSystemPart)
+  const messages = composeMessages(event.messages)
+  const tools = composeTools(event.tools)
+  const sum = (values: number[]): number => values.reduce((a, b) => a + (b > 0 ? b : 0), 0)
+  const contentBytes = sum(messages.flatMap((m) => m.parts.map((p) => p.bytes)))
+  const contentRendered = sum(messages.flatMap((m) => m.parts.map((p) => p.rendered)))
   return {
-    hook: "context",
-    time: new Date().toISOString(),
-    sessionID: event.sessionID,
-    agent: event.agent,
-    model: describe(event.model, "soft", 2, new Set()),
-    system: event.system.map(describeSystemPart),
-    messages: event.messages.map(describeMessage),
-    tools: describeTools(event.tools),
-    options: describe(event.options, "hard", 3, new Set()),
+    system,
+    messages,
+    tools,
+    totals: {
+      systemBytes: sum(system.map((s) => s.bytes)),
+      systemRendered: sum(system.map((s) => s.rendered)),
+      contentBytes,
+      contentRendered,
+      toolsBytes: sum(tools.map((t) => t.descBytes + t.schemaBytes)),
+      toolsRendered: sum(tools.map((t) => t.descRendered + t.schemaRendered + utf8(t.name))),
+    },
   }
 }
 
 /**
- * Describe a wire body: JSON bodies are parsed and walked; other bodies are sized and
- * sampled.
+ * Normalize provider-reported usage to the DB token shape.
  *
- * @param text - The full body text, read from a clone.
- * @param contentType - The body's content type, if any.
- * @returns The redacted shape of the body.
+ * When the provider reports `prompt_tokens_details.cached_tokens` (ollama /
+ * Anthropic-style), `input` is the uncached remainder and `cache.read` the cached
+ * prefix; otherwise `input` is the full prompt (lmstudio / plain OpenAI-style,
+ * `cache.read` 0). `reasoning` is the provider's reasoning count and `output` the
+ * non-reasoning remainder of `completion_tokens` — matching the DB row, which
+ * stores them split (verified: DB output + reasoning == provider completion).
+ *
+ * @param usage - The raw usage object from the final response frame.
+ * @returns The normalized token figures, or null when usage is absent.
  */
-function describeBody(text: string, contentType: string | null): Shape {
-  if (text.length === 0) return { bytes: 0, empty: true }
-  if (contentType !== null && contentType.includes("json")) {
-    try {
-      const parsed: unknown = JSON.parse(text)
-      return { bytes: utf8(text), parsed: describe(parsed, "soft", MAX_DEPTH, new Set()) }
-    } catch {
-      return { bytes: utf8(text), parseError: true }
-    }
+function normalizeTokens(usage: UsageShape | null): TokensShape | null {
+  if (usage === null || typeof usage !== "object") return null
+  const prompt = typeof usage["prompt_tokens"] === "number" ? usage["prompt_tokens"] : null
+  const completion =
+    typeof usage["completion_tokens"] === "number" ? usage["completion_tokens"] : null
+  if (prompt === null) return null
+  const details = (usage["prompt_tokens_details"] ?? {}) as Record<string, unknown>
+  const cached = typeof details["cached_tokens"] === "number" ? details["cached_tokens"] : 0
+  const write =
+    typeof details["cache_creation_tokens"] === "number" ? details["cache_creation_tokens"] : 0
+  const compDetails = (usage["completion_tokens_details"] ?? {}) as Record<string, unknown>
+  const reasoning = typeof compDetails["reasoning_tokens"] === "number" ? compDetails["reasoning_tokens"] : 0
+  return {
+    input: cached > 0 ? prompt - cached : prompt,
+    output: (completion ?? 0) - reasoning,
+    reasoning,
+    cache: { read: cached, write },
   }
-  return { bytes: utf8(text), sample: text.slice(0, SHORT) }
 }
 
 /**
@@ -307,24 +422,24 @@ function describeBody(text: string, contentType: string | null): Shape {
  * @param contentType - The body's content type, if any.
  * @returns The last usage object found in the body, or null.
  */
-function extractUsage(text: string, contentType: string | null): Shape {
+function extractUsage(text: string, contentType: string | null): UsageShape | null {
   if (contentType !== null && contentType.includes("json")) {
     try {
       const body = JSON.parse(text) as { usage?: unknown }
-      return body.usage !== undefined ? describe(body.usage, "soft", 3, new Set()) : null
+      return body.usage !== undefined ? (body.usage as UsageShape) : null
     } catch {
       return null
     }
   }
   if (contentType === null || contentType.includes("event-stream") || text.startsWith("data:")) {
-    let last: Shape = null
+    let last: UsageShape | null = null
     for (const line of text.split("\n")) {
       if (!line.startsWith("data:")) continue
       const payload = line.slice(5).trim()
       if (payload === "[DONE]") continue
       try {
         const frame = JSON.parse(payload) as { usage?: unknown }
-        if (frame.usage !== undefined) last = describe(frame.usage, "soft", 3, new Set())
+        if (frame.usage !== undefined) last = frame.usage as UsageShape
       } catch {
         // Keepalive or non-JSON frame: nothing to record.
       }
@@ -334,81 +449,259 @@ function extractUsage(text: string, contentType: string | null): Shape {
   return null
 }
 
-/**
- * Describe an `http.request` hook event: the wire request after provider lowering.
- *
- * @param event - The http.request event as fired by OpenCode.
- * @returns The redacted shape of the request, with the body read from a clone.
- */
-async function describeHttpRequest(event: SessionHttpRequest): Promise<Shape> {
-  const text = await event.request.clone().text()
-  return {
-    hook: "http.request",
-    time: new Date().toISOString(),
-    sessionID: event.sessionID,
-    agent: event.agent,
-    model: describe(event.model, "soft", 2, new Set()),
-    kind: event.kind,
-    url: event.request.url,
-    method: event.request.method,
-    headers: describeHeaders(event.request.headers),
-    body: describeBody(text, event.request.headers.get("content-type")),
-  }
+/** One queued composition awaiting its `primary` request. */
+interface Pending {
+  time: number
+  composition: CompositionShape
 }
 
-/**
- * Describe an `http.response` hook event, extracting provider-reported usage.
- *
- * @param event - The http.response event as fired by OpenCode.
- * @returns The redacted shape of the response, with the body read from a clone.
- */
-async function describeHttpResponse(event: SessionHttpResponse): Promise<Shape> {
-  const text = await event.response.clone().text()
-  const contentType = event.response.headers.get("content-type")
-  return {
-    hook: "http.response",
-    time: new Date().toISOString(),
-    sessionID: event.sessionID,
-    agent: event.agent,
-    model: describe(event.model, "soft", 2, new Set()),
-    kind: event.kind,
-    status: event.response.status,
-    statusText: event.response.statusText,
-    headers: describeHeaders(event.response.headers),
-    body: {
-      contentType,
-      shape: describeBody(text, contentType),
-      usage: extractUsage(text, contentType),
-    },
-  }
+/** One in-flight request awaiting its response. */
+interface InFlight {
+  request: Request
+  key: string
+  kind: string
+  time: number
 }
 
 export default Plugin.define({
   id: "opencode-what-context",
   async setup(ctx) {
-    console.log(`[what-context] loaded in OpenCode ${ctx.app.version}`)
+    console.log(`[what-context] v2 loaded in OpenCode ${ctx.app.version} (full=${FULL})`)
 
-    const counters = new Map<string, number>()
-    const store = (hook: string, sessionID: string, record: Promise<Shape> | Shape): void => {
-      const base = `wc/${hook}/${sessionID}`
-      const key = `${base}/${String((counters.get(base) ?? 0) + 1).padStart(3, "0")}`
-      counters.set(base, (counters.get(base) ?? 0) + 1)
-      Promise.resolve(record)
-        .then((value) => ctx.storage.set(key, value))
-        .then(() => console.log(`[what-context] stored ${key}`))
-        .catch((error: unknown) => console.error(`[what-context] failed to store ${key}:`, error))
+    /** Pending compositions per session, in fire order. */
+    const pending = new Map<string, Pending[]>()
+    /** In-flight requests per session, in dispatch order. */
+    const inflight = new Map<string, InFlight[]>()
+    /** Next sequence number per session (once initialized). */
+    const seq = new Map<string, number>()
+    /** In-flight initialization promises, so concurrent calls for a session share one scan. */
+    const seqInit = new Map<string, Promise<void>>()
+
+    /**
+     * Initialize a session's sequence counter from existing records, so a plugin
+     * hot-reload (which resets the maps) never collides with prior keys.
+     *
+     * @param sessionID - The session to initialize.
+     * @returns A promise that resolves when the counter is initialized.
+     */
+    function ensureSeq(sessionID: string): Promise<void> {
+      const existing = seqInit.get(sessionID)
+      if (existing) return existing
+      const init = (async () => {
+        if (seq.has(sessionID)) return
+        let highest = 0
+        try {
+          const scan = await ctx.storage.scan({ prefix: `wc/call/${sessionID}/`, limit: 10_000 })
+          for (const entry of scan.entries) {
+            const number = Number(entry.key.slice(`wc/call/${sessionID}/`.length))
+            if (Number.isInteger(number) && number > highest) highest = number
+          }
+        } catch {
+          // Fresh session or scan failure: start at 1.
+        }
+        if (!seq.has(sessionID)) seq.set(sessionID, highest + 1)
+      })()
+      seqInit.set(sessionID, init)
+      return init
+    }
+
+    /**
+     * Reserve the next sequence number for a session.
+     *
+     * Concurrent reservations (a title call fires in parallel with the first
+     * primary) must never receive the same number: the scan is shared, and the
+     * read-and-bump below is synchronous.
+     *
+     * @param sessionID - The session the number is for.
+     * @returns The reserved sequence number.
+     */
+    async function nextSeq(sessionID: string): Promise<number> {
+      await ensureSeq(sessionID)
+      const value = seq.get(sessionID) ?? 1
+      seq.set(sessionID, value + 1)
+      return value
+    }
+
+    /**
+     * Store a record under its call key.
+     *
+     * @param sessionID - The session the record belongs to.
+     * @param number - The record's sequence number.
+     * @param record - The record to store.
+     * @returns The storage key used.
+     */
+    async function save(sessionID: string, number: number, record: CallRecord): Promise<string> {
+      const key = `wc/call/${sessionID}/${String(number).padStart(4, "0")}`
+      await ctx.storage.set(key, record as unknown as Json)
+      console.log(`[what-context] stored ${key} (${record.kind})`)
+      return key
+    }
+
+    /**
+     * Drop stale pending compositions and orphaned in-flight requests for a session.
+     *
+     * @param sessionID - The session to prune.
+     */
+    async function prune(sessionID: string): Promise<void> {
+      const now = Date.now()
+      const queue = pending.get(sessionID)
+      if (queue) {
+        const fresh = queue.filter((entry) => now - entry.time < STALE_MS)
+        if (fresh.length !== queue.length) pending.set(sessionID, fresh)
+      }
+      const live = inflight.get(sessionID)
+      if (live) {
+        const stale = live.filter((entry) => now - entry.time >= ORPHAN_MS)
+        if (stale.length > 0) {
+          // Re-check after the awaits below: skip the drop when a concurrent
+          // request pushed a newer list (the snapshot would clobber it).
+          if (inflight.get(sessionID) === live) {
+            inflight.set(sessionID, live.filter((entry) => now - entry.time < ORPHAN_MS))
+          }
+          for (const entry of stale) {
+            try {
+              const existing = (await ctx.storage.get(entry.key)) as CallRecord | undefined
+              if (existing) {
+                existing.orphan = true
+                await ctx.storage.set(entry.key, existing as unknown as Json)
+              }
+            } catch {
+              // Orphan marking is best-effort.
+            }
+          }
+        }
+      }
     }
 
     await ctx.session.hook("context", (event) => {
-      store("context", event.sessionID, describeContext(event))
+      void (async () => {
+        await prune(event.sessionID)
+        const queue = pending.get(event.sessionID) ?? []
+        if (queue.length > 0) {
+          console.warn(
+            `[what-context] ${event.sessionID}: ${queue.length} composition(s) pending before a new context; keeping only the freshest`,
+          )
+        }
+        pending.set(event.sessionID, [
+          { time: Date.now(), composition: compose(event) },
+        ])
+      })()
     })
 
     await ctx.session.hook("http.request", (event) => {
-      store("http.request", event.sessionID, describeHttpRequest(event))
+      void (async () => {
+        const number = await nextSeq(event.sessionID)
+        const key = `wc/call/${event.sessionID}/${String(number).padStart(4, "0")}`
+        await prune(event.sessionID)
+
+        // Consume the pending composition for primary calls only; it is the sole
+        // source of per-part boundaries. Non-primary kinds get no composition.
+        let composition: CompositionShape | null = null
+        if (event.kind === "primary") {
+          const queue = pending.get(event.sessionID) ?? []
+          if (queue.length > 0) composition = queue.shift()?.composition ?? null
+          if (queue.length > 0) {
+            console.warn(`[what-context] ${event.sessionID}: ${queue.length} compositions still queued after consumption`)
+          }
+        }
+
+        // Read the wire body from a clone: its byte size is the overhead cross-check.
+        let bodyBytes: number | null = null
+        let body: string | undefined
+        try {
+          const text = await event.request.clone().text()
+          bodyBytes = new TextEncoder().encode(text).length
+          if (FULL) body = text
+        } catch {
+          bodyBytes = event.request.headers.get("content-length")
+            ? Number(event.request.headers.get("content-length"))
+            : null
+        }
+
+        const compositionRendered = composition
+          ? composition.totals.systemRendered +
+            composition.totals.contentRendered +
+            composition.totals.toolsRendered
+          : null
+        const record: CallRecord = {
+          v: 2,
+          full: FULL,
+          kind: event.kind,
+          sessionID: event.sessionID,
+          agent: event.agent,
+          model: {
+            id: event.model.id,
+            providerID: event.model.providerID,
+            ...(event.model.variant !== undefined ? { variant: event.model.variant } : {}),
+          },
+          request: {
+            time: new Date().toISOString(),
+            url: event.request.url,
+            method: event.request.method,
+            bodyBytes,
+            ...(body !== undefined ? { body } : {}),
+          },
+          composition,
+          overhead: {
+            bodyBytes,
+            compositionRendered,
+            delta:
+              bodyBytes !== null && compositionRendered !== null
+                ? bodyBytes - compositionRendered
+                : null,
+          },
+          response: null,
+          tokens: null,
+        }
+        await save(event.sessionID, number, record)
+
+        inflight.set(event.sessionID, [
+          ...(inflight.get(event.sessionID) ?? []),
+          { request: event.request, key, kind: event.kind, time: Date.now() },
+        ])
+      })()
     })
 
     await ctx.session.hook("http.response", (event) => {
-      store("http.response", event.sessionID, describeHttpResponse(event))
+      void (async () => {
+        // Match by object identity first; the response event carries the same
+        // Request object the request event received.
+        let entry = (inflight.get(event.sessionID) ?? []).find((candidate) => candidate.request === event.request)
+        if (entry === undefined) {
+          // Fallback: the oldest in-flight request of the same kind.
+          entry = (inflight.get(event.sessionID) ?? []).find((candidate) => candidate.kind === event.kind)
+        }
+        if (entry === undefined) {
+          console.warn(`[what-context] ${event.sessionID}: response for ${event.kind} with no in-flight request`)
+          return
+        }
+        const live = (inflight.get(event.sessionID) ?? []).filter((candidate) => candidate !== entry)
+        inflight.set(event.sessionID, live)
+
+        let text = ""
+        try {
+          text = await event.response.clone().text()
+        } catch {
+          // Unreadable body: record the status without usage.
+        }
+        const usage = extractUsage(text, event.response.headers.get("content-type"))
+
+        try {
+          const existing = (await ctx.storage.get(entry.key)) as CallRecord | undefined
+          if (existing === undefined) return
+          existing.response = {
+            time: new Date().toISOString(),
+            status: event.response.status,
+            usage,
+            ...(FULL ? { body: text } : {}),
+          }
+          existing.tokens = normalizeTokens(usage)
+          delete existing.orphan
+          await ctx.storage.set(entry.key, existing as unknown as Json)
+        } catch (error) {
+          console.error(`[what-context] failed to update ${entry.key}:`, error)
+        }
+      })()
     })
   },
 })

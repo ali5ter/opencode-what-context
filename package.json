@@ -17,6 +17,8 @@
     "@opencode/plugin": "2.2.7"
   },
   "devDependencies": {
+    "@huggingface/transformers": "^4.3.2",
+    "@types/node": "^26.6.6",
     "typescript": "^5.9.0"
   },
   "license": "MIT"
