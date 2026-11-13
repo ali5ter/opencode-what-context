@@ -5,10 +5,24 @@ request.
 
 ## What it does
 
-Every time OpenCode calls a model — the agent loop, tool continuations, compaction, title
-generation — the plugin captures the assembled context: system instructions by source, tool
-schemas, and conversation, and renders a [dsh-context](https://github.com/bowenliang123/dsh-context)-style
-panel in the TUI: a per-request composition chart, a request history, and a context trend.
+Every time OpenCode calls a model, the plugin records what went out. Agent-loop calls carry the
+assembled context — system instructions by source, tool schemas, and conversation; every call
+also carries the wire body size and the provider's reported usage. In the TUI the records render
+as a [dsh-context](https://github.com/bowenliang123/dsh-context)-style panel: a context-window
+gauge, a request history, a per-request composition bar, and a token trend.
+
+## Install
+
+```sh
+opencode plugin add github:ali5ter/opencode-what-context
+```
+
+The package is installed from the Git repository on first start, so restart OpenCode afterwards.
+
+## Usage
+
+Open the panel in the TUI with the `/context` command or the `<leader>v` keybinding. Use `j`/`k`
+to move through the request history, `f` to toggle fullscreen, and `q` to close.
 
 ## Why
 
@@ -16,15 +30,17 @@ OpenCode persists per-message token and cost totals in its SQLite session databa
 served request body. A community `/context` plugin —
 [`opencode-context-usage`](https://github.com/angeloper86/opencode-context-usage) by angeloper86 —
 answers *how many*: token totals by category, cache hit rate, cost, including delegated subagents.
-Nothing answers *what*: the served request body is not persisted, so the composition of the context
-(system instructions, tool schemas, conversation) stays invisible. This plugin closes that gap
-through the V2 plugin API's session hooks. The motivation, the information map, and the full
-research are in the
-[ai-local-first research notes](https://github.com/ali5ter/ai-local-first/blob/main/docs/research/2026-11-11-llm-monitoring-tools.md).
+Nothing answers *what*: the served request body is not persisted, so the composition of the
+context (system instructions, tool schemas, conversation) stays invisible. This plugin closes
+that gap through the [plugin API](https://opencode.ai/docs/plugins/) session hooks. The
+motivation, the information map, and the research behind this project are documented in a
+private research repository — happy to share on request.
 
 ## Status
 
-Scaffold — no released functionality yet.
+v0.1.0 — the capture and the TUI panel are complete. Per-part token counts are estimated by
+apportioning the provider-reported prompt total over rendered bytes; the provider's reported
+totals remain the ground truth the gauge and trend are built on.
 
 ## License
 
