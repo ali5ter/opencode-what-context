@@ -5,6 +5,8 @@
     "module": "preserve",
     "moduleResolution": "bundler",
     "strict": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@opentui/solid",
     "noEmit": true,
     "skipLibCheck": true,
     "types": []

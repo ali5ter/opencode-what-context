@@ -14,6 +14,10 @@
  * - `http.response` supplies provider-reported usage, normalized to the DB token shape
  *   `{input, output, reasoning, cache: {read, write}}`.
  *
+ * Build step 3 adds the presentation seam: the records are served to the TUI
+ * part (`tui.tsx`) over the `what-context` RPC (`rpc.ts`) and each write is
+ * announced with a `recorded` event so an open panel stays live.
+ *
  * Pairing detail: the response event carries the same `Request` object the request
  * event received, so the response is matched to its in-flight record by object
  * identity, with per-kind FIFO as fallback.
@@ -33,9 +37,19 @@ import type {
   SessionHttpRequest,
   SessionHttpResponse,
 } from "@opencode/plugin/promise/session"
-
-/** A JSON-safe value, structurally compatible with `Schema.Json`. */
-type Shape = null | boolean | number | string | Shape[] | { [key: string]: Shape }
+import { WhatContext } from "./rpc"
+import type {
+  CallRecord,
+  CallView,
+  CompositionShape,
+  MessageShape,
+  PartShape,
+  SourceShape,
+  SystemShape,
+  TokensShape,
+  ToolShape,
+  UsageShape,
+} from "./types"
 
 /** The plugin storage value type. */
 type Json = StorageEntry["value"]
@@ -101,113 +115,6 @@ function str(value: unknown): string {
  */
 function sample(text: string): string | null {
   return text.length === 0 ? null : text.slice(0, SAMPLE)
-}
-
-/** Per-source breakdown of the instructions system part. */
-interface SourceShape {
-  key: string
-  bytes: number
-  rendered: number
-  sample: string | null
-  text?: string
-}
-
-/** One system part of the request. */
-interface SystemShape {
-  bytes: number
-  rendered: number
-  sample: string | null
-  sources?: SourceShape[]
-  text?: string
-}
-
-/** One content part of one message. */
-interface PartShape {
-  type: string
-  bytes: number
-  rendered: number
-  sample: string | null
-  tool?: string
-  text?: string
-}
-
-/** One message of the conversation. */
-interface MessageShape {
-  role: string
-  parts: PartShape[]
-}
-
-/** One tool entry of the request. */
-interface ToolShape {
-  name: string
-  descBytes: number
-  descRendered: number
-  schemaBytes: number
-  schemaRendered: number
-  description?: string
-  schema?: unknown
-}
-
-/** The per-call composition, from the `context` event (primary calls only). */
-interface CompositionShape {
-  system: SystemShape[]
-  messages: MessageShape[]
-  tools: ToolShape[]
-  totals: {
-    systemBytes: number
-    systemRendered: number
-    contentBytes: number
-    contentRendered: number
-    toolsBytes: number
-    toolsRendered: number
-  }
-}
-
-/** Provider-reported usage, raw as delivered in the final response frame. */
-interface UsageShape {
-  prompt_tokens?: number
-  completion_tokens?: number
-  total_tokens?: number
-  [key: string]: Shape | undefined
-}
-
-/** Normalized to the DB `session_message.data.tokens` shape. */
-interface TokensShape {
-  input: number
-  output: number
-  reasoning: number
-  cache: { read: number; write: number }
-}
-
-/** The stored per-call record. */
-interface CallRecord {
-  v: 2
-  full: boolean
-  kind: string
-  sessionID: string
-  agent: string
-  model: { id: string; providerID: string; variant?: string }
-  request: {
-    time: string
-    url: string
-    method: string
-    bodyBytes: number | null
-    body?: string
-  }
-  composition: CompositionShape | null
-  overhead: {
-    bodyBytes: number | null
-    compositionRendered: number | null
-    delta: number | null
-  }
-  response: {
-    time: string
-    status: number
-    usage: UsageShape | null
-    body?: string
-  } | null
-  tokens: TokensShape | null
-  orphan?: boolean
 }
 
 /**
@@ -459,6 +366,7 @@ interface Pending {
 interface InFlight {
   request: Request
   key: string
+  seq: number
   kind: string
   time: number
 }
@@ -466,7 +374,40 @@ interface InFlight {
 export default Plugin.define({
   id: "opencode-what-context",
   async setup(ctx) {
-    console.log(`[what-context] v2 loaded in OpenCode ${ctx.app.version} (full=${FULL})`)
+    console.log(`[what-context] v3 loaded in OpenCode ${ctx.app.version} (full=${FULL})`)
+
+    // Serve the captured records to the TUI over RPC and announce each write so
+    // an open panel refetches. The TUI part cannot read this storage directly
+    // (different process, different backend); the bridge is `rpc.ts`.
+    const rpc = await ctx.rpc.register(WhatContext, {
+      calls: async (input) => {
+        const { sessionID } = input as { sessionID: string }
+        const prefix = `wc/call/${sessionID}/`
+        const scan = await ctx.storage.scan({ prefix, limit: 10_000 })
+        const views: CallView[] = scan.entries.map((entry) => ({
+          ...(entry.value as unknown as CallRecord),
+          seq: Number(entry.key.slice(prefix.length)),
+        }))
+        views.sort((a, b) => a.seq - b.seq)
+        return views
+      },
+      call: async (input) => {
+        const { sessionID, seq } = input as { sessionID: string; seq: number }
+        const key = `wc/call/${sessionID}/${String(seq).padStart(4, "0")}`
+        const record = await ctx.storage.get(key)
+        return record === undefined ? null : { ...(record as unknown as CallRecord), seq }
+      },
+    })
+
+    /**
+     * Announce a written or updated record to any connected TUI.
+     *
+     * @param sessionID - The record's session.
+     * @param seq - The record's sequence number.
+     */
+    function announce(sessionID: string, seq: number): void {
+      void rpc.events.emit("recorded", { sessionID, seq })
+    }
 
     /** Pending compositions per session, in fire order. */
     const pending = new Map<string, Pending[]>()
@@ -654,10 +595,11 @@ export default Plugin.define({
           tokens: null,
         }
         await save(event.sessionID, number, record)
+        announce(event.sessionID, number)
 
         inflight.set(event.sessionID, [
           ...(inflight.get(event.sessionID) ?? []),
-          { request: event.request, key, kind: event.kind, time: Date.now() },
+          { request: event.request, key, seq: number, kind: event.kind, time: Date.now() },
         ])
       })()
     })
@@ -698,6 +640,7 @@ export default Plugin.define({
           existing.tokens = normalizeTokens(usage)
           delete existing.orphan
           await ctx.storage.set(entry.key, existing as unknown as Json)
+          announce(event.sessionID, entry.seq)
         } catch (error) {
           console.error(`[what-context] failed to update ${entry.key}:`, error)
         }
