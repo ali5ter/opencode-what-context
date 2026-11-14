@@ -32,15 +32,7 @@ served request body. A community `/context` plugin —
 answers *how many*: token totals by category, cache hit rate, cost, including delegated subagents.
 Nothing answers *what*: the served request body is not persisted, so the composition of the
 context (system instructions, tool schemas, conversation) stays invisible. This plugin closes
-that gap through the [plugin API](https://opencode.ai/docs/plugins/) session hooks. The
-motivation, the information map, and the research behind this project are documented in a
-private research repository — happy to share on request.
-
-## Status
-
-v0.1.0 — the capture and the TUI panel are complete. Per-part token counts are estimated by
-apportioning the provider-reported prompt total over rendered bytes; the provider's reported
-totals remain the ground truth the gauge and trend are built on.
+that gap through the [plugin API](https://opencode.ai/docs/plugins/) session hooks.
 
 ## License
 
