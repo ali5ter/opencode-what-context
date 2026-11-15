@@ -26,9 +26,11 @@
 
 import { Plugin } from "@opencode/plugin/tui"
 import type { Context, PanelInput } from "@opencode/plugin/tui/context"
+import type { LocationRef } from "@opencode/client"
 import type { RGBA, ScrollBoxRenderable } from "@opentui/core"
 import { MouseButton, TextAttributes } from "@opentui/core"
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import { realpathSync } from "node:fs"
 import { estimate, type SliceName } from "./estimate"
 import { WhatContext } from "./rpc"
 import type { CallView } from "./types"
@@ -101,6 +103,38 @@ function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}m`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
   return `${n}`
+}
+
+/**
+ * Resolve a directory to its real path, tolerating paths that no longer exist
+ * (for instance a project directory removed while the TUI is open).
+ *
+ * @param directory - The directory as supplied by the TUI or the session.
+ * @returns The real path, or the input when it cannot be resolved.
+ */
+function canonicalize(directory: string): string {
+  try {
+    return realpathSync(directory)
+  } catch {
+    return directory
+  }
+}
+
+/**
+ * A readable message for any thrown value. RPC errors cross the wire as plain
+ * objects rather than `Error` instances, so `String(err)` would yield
+ * `[object Object]`.
+ *
+ * @param err - The thrown value.
+ * @returns Its message, or its string form.
+ */
+function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message
+  if (typeof err === "object" && err !== null) {
+    const message = (err as { readonly message?: unknown }).message
+    if (typeof message === "string" && message.length > 0) return message
+  }
+  return String(err)
 }
 
 /**
@@ -260,13 +294,23 @@ function Panel(props: { context: Context; panel: PanelInput }) {
   const theme = context.theme
   const client = context.client
   /**
-   * The service routes each RPC call to a location, and the plugin's RPC is
-   * registered against the project's — so every call must carry the TUI's
-   * location or the service answers `rpc.unavailable`.
+   * The location for every RPC call.
+   *
+   * The service routes each RPC call to a location and matches its directory
+   * literally, but a macOS shell yields a symlinked directory in its logical
+   * form (`/var/folders/...` while the service registered `/private/var/...`),
+   * so the TUI's own `context.location` can fail to route and the call 400s
+   * with `rpc.unavailable`. The session's stored location is canonical — the
+   * service realpaths on storage — so prefer it, and canonicalize whatever is
+   * sent either way.
    */
-  const location = context.location
-    ? { directory: context.location.directory }
-    : undefined
+  const location = createMemo<LocationRef | undefined>(() => {
+    const directory =
+      context.data.session.get(props.panel.sessionID)?.location?.directory ??
+      context.location?.directory
+    if (directory === undefined) return undefined
+    return { directory: canonicalize(directory) }
+  })
 
   const [records, setRecords] = createSignal<CallView[]>([])
   const [error, setError] = createSignal<string | null>(null)
@@ -294,8 +338,9 @@ function Panel(props: { context: Context; panel: PanelInput }) {
   async function load(retries = 0): Promise<void> {
     const sessionID = props.panel.sessionID
     const gen = ++generation
+    const loc = location()
     try {
-      const out = await client.rpc(WhatContext).calls({ sessionID }, { location })
+      const out = await client.rpc(WhatContext).calls({ sessionID }, { location: loc })
       if (gen !== generation) return
       const views = ((out as unknown) ?? []) as unknown as CallView[]
       views.sort((a, b) => a.seq - b.seq)
@@ -316,7 +361,7 @@ function Panel(props: { context: Context; panel: PanelInput }) {
         return
       }
       setRecords([])
-      setError(err instanceof Error ? err.message : String(err))
+      setError(errorText(err))
     }
   }
 
@@ -373,7 +418,7 @@ function Panel(props: { context: Context; panel: PanelInput }) {
   const windowSize = createMemo(() => {
     const rec = current()
     if (rec !== undefined) {
-      const models = context.data.location.model.list(context.location) ?? []
+      const models = context.data.location.model.list(location()) ?? []
       const info = models.find(
         (model) => model.providerID === rec.model.providerID && model.modelID === rec.model.id,
       )
