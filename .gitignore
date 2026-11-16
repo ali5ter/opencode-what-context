@@ -1,4 +1,4 @@
-# AI context (kept locally; may move to the private ai-context repo with a symlink)
+# AI context files live in the private ai-context repo (ali5ter/ai-context); local copies are symlinks
 AGENTS.md
 AGENTS.md.backup.*
 CLAUDE.md
