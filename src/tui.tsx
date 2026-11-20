@@ -20,9 +20,17 @@
  * theme — the luminance steps (text.base/muted/faint), glyph shape (block
  * densities, markers), and bold — while the house hues (accent for system,
  * interactive for messages, neutral for tools) remain decoration that reads
- * better on colored terminals. Layout: a list + detail split that collapses to
- * a column in a narrow panel, a stacked composition bar with a legend, and a
- * trend strip with a marker row.
+ * better on colored terminals. Layout: three stacked sections behind one-line
+ * dividers, each divider a quiet rule carrying a bold embedded label and,
+ * where the section has a headline figure, that figure right-aligned at the
+ * rule's end — the heading treatment of btop, the reference for the panel's
+ * structure (its boxes share borders; the stack is the single-column form).
+ * The sections: the selected request's composition (the bar carries the
+ * prompt total at its end, then the legend and the per-source, per-part, and
+ * per-tool breakdowns, the response figures, and the free space) on top, the
+ * full-width trend strip in the middle (the window size rides the divider,
+ * the curve's scale label), and the request list — with a column header row —
+ * growing at the bottom.
  *
  * Author: Alister Lewis-Bowen <alister@lewis-bowen.org>
  */
@@ -42,14 +50,8 @@ import type { CallView } from "./types"
 /** The content name the panel slot publishes for this plugin. */
 const NAME = "what-context"
 
-/** The request list's fixed width in the split layout. */
-const LIST_WIDTH = 36
-
-/** The split layout needs this width before the detail can breathe. */
-const SPLIT_MIN_WIDTH = 76
-
 /** Detail bars are at most this many cells. */
-const BAR_WIDTH = 20
+const BAR_WIDTH = 32
 
 /** Header gauge width in cells. */
 const GAUGE_CELLS = 10
@@ -70,6 +72,26 @@ const LOAD_RETRY_BASE_MS = 250
 
 /** One-cell-per-request trend blocks, low to full. */
 const BLOCKS = "▁▂▃▄▅▆▇█"
+
+/**
+ * Request-list column widths, shared by the rows and the header row so the
+ * two cannot drift apart. The token column is right-aligned (a figure), the
+ * others left-aligned.
+ */
+const LIST_KIND_WIDTH = 7
+const LIST_TOKEN_WIDTH = 6
+const LIST_FILL_WIDTH = 8
+
+/** The list's header row: a label under each column, btop-style. */
+const LIST_HEADER =
+  " " +
+  "#seq".padEnd(5) +
+  "  " +
+  "kind".padEnd(LIST_KIND_WIDTH) +
+  "  " +
+  "tokens".padStart(LIST_TOKEN_WIDTH) +
+  "  " +
+  "window".padEnd(LIST_FILL_WIDTH)
 
 /**
  * One block glyph per slice, in wire-body order. The four block densities are
@@ -529,8 +551,13 @@ function Panel(props: { context: Context; panel: PanelInput }) {
 
   const width = () => props.panel.width
   const docked = () => props.panel.presentation === "panel"
-  const split = () => width() >= SPLIT_MIN_WIDTH
-  const barWidth = createMemo(() => Math.max(8, Math.min(BAR_WIDTH, Math.max(0, width()) - 60)))
+  /** The content width inside the panel's left/right padding. */
+  const contentWidth = () => Math.max(0, width() - 2)
+  /**
+   * The composition bar's width: at most `BAR_WIDTH`, but reserving the cells
+   * the trailing prompt figure needs, so the value always fits the line.
+   */
+  const barWidth = createMemo(() => Math.max(8, Math.min(BAR_WIDTH, contentWidth() - 8)))
 
   // In fullscreen the session is hidden, so the panel is the only surface;
   // docked, it only owns keys while the host focuses it.
@@ -618,17 +645,23 @@ function Panel(props: { context: Context; panel: PanelInput }) {
   })
 
   /**
-   * The trend label: how many of the session's requests the strip shows, and
-   * the window size the block heights are a share of.
+   * The trend divider's summary figure: the window size the block heights are
+   * a share of — the curve's scale label, carried on the divider (btop keeps
+   * a graph's scale at the frame's edge, not beside the curve), which leaves
+   * the strip and its marker row the divider's full width.
    */
-  const trendLabel = createMemo(() => {
-    const total = records().length
-    const shown = Math.min(TREND_MAX, total)
+  const trendSummary = createMemo(() => {
     const window = windowSize()
-    return `trend ${shown < total ? `${shown} of ${total} · ` : ""}${
-      window !== undefined ? `${formatTokens(window)} window` : ""
-    }`
+    if (window === undefined) return ""
+    const total = records().length
+    const shown = trend().length
+    // The scale label, plus a truncation figure when the strip can only show
+    // part of the session's history.
+    return shown < total ? `${formatTokens(window)} · ${shown}/${total}` : formatTokens(window)
   })
+
+  /** The requests divider's summary figure: how many calls were captured. */
+  const requestsSummary = createMemo(() => String(records().length))
 
   const headerGauge = createMemo(() => {
     const rec = current()
@@ -691,7 +724,8 @@ function Panel(props: { context: Context; panel: PanelInput }) {
         </Show>
       </box>
 
-      {/* Body: list + detail, split when wide, column when narrow. */}
+      {/* Body: three stacked sections — the selected request's composition,
+          the trend, and the request list — each behind a one-line divider. */}
       <Show
         when={error() === null && records().length > 0}
         fallback={
@@ -711,70 +745,8 @@ function Panel(props: { context: Context; panel: PanelInput }) {
           </box>
         }
       >
-        <box flexGrow={1} minHeight={0} minWidth={0} flexDirection={split() ? "row" : "column"} gap={1}>
-          {/* Request list. */}
-          <scrollbox
-            ref={(value) => {
-              list = value
-            }}
-            scrollY
-            flexGrow={split() ? 0 : 2}
-            flexShrink={split() ? 0 : 1}
-            width={split() ? LIST_WIDTH : "100%"}
-            height={split() ? "100%" : 6}
-            minWidth={0}
-            minHeight={0}
-          >
-            <box flexDirection="column" minWidth={0}>
-              <For each={records()}>
-                {(rec, index) => {
-                  const selectedHere = index() === selection()
-                  const f = fill(rec)
-                  const kind =
-                    rec.kind === "primary"
-                      ? "primary"
-                      : rec.kind === "compaction"
-                        ? "compact"
-                        : rec.kind === "title"
-                          ? "title"
-                          : rec.kind.slice(0, 7)
-                  const prompt = estimate(rec).prompt
-                  const mini = f === null ? "·".repeat(8) : "▇".repeat(Math.min(8, Math.round(f * 8))) + "░".repeat(Math.max(0, 8 - Math.min(8, Math.round(f * 8))))
-                  // The selected row takes base + bold (and the raised surface);
-                  // non-primary kinds recede to faint so the primary calls read
-                  // as the list's spine. The mini gauge carries the window
-                  // fill, so no separate percentage column.
-                  const rowFg = selectedHere ? theme.text.base : theme.text.muted
-                  return (
-                    <box
-                      id={`wc-row-${rec.seq}`}
-                      height={1}
-                      minWidth={0}
-                      backgroundColor={selectedHere ? theme.background.raised.high : undefined}
-                      onMouseDown={(event) => {
-                        if (event.button !== MouseButton.LEFT) return
-                        select(index())
-                      }}
-                    >
-                      <text
-                        fg={rowFg}
-                        attributes={selectedHere ? TextAttributes.BOLD : undefined}
-                        wrapMode="none"
-                        truncate
-                        selectable={false}
-                      >
-                        {`${selectedHere ? "▸" : " "}#${String(rec.seq).padStart(4, "0")}  `}
-                        <span style={{ fg: selectedHere ? rowFg : rec.kind === "primary" ? theme.text.muted : theme.text.faint }}>
-                          {kind.padEnd(7)}
-                        </span>
-                        {`  ${prompt === null ? "·····" : formatTokens(prompt)}  ${mini}`}
-                      </text>
-                    </box>
-                  )
-                }}
-              </For>
-            </box>
-          </scrollbox>
+        <box flexDirection="column" flexGrow={1} minHeight={0} minWidth={0} gap={1}>
+          <SectionRule label="context" width={contentWidth} theme={theme} />
 
           {/* Detail: the four-slice composition of the selected request.
               Keyed: the callback receives the record itself and re-runs
@@ -794,17 +766,26 @@ function Panel(props: { context: Context; panel: PanelInput }) {
               const cacheRead = est.cacheRead
               const cacheHit = prompt !== null && prompt > 0 && cacheRead !== null ? cacheRead / prompt : 0
               return (
-                <box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={0} minHeight={0} gap={0}>
+                <box flexDirection="column" minWidth={0} flexShrink={0} gap={0}>
                   {/* The prompt as one stacked bar: segment width is share,
                       block density is identity. Non-primary kinds carry no
                       composition at all. */}
                   {slices.length > 0 ? (
-                    <CompositionBar slices={slices} barWidth={barWidth()} theme={theme} />
+                    <CompositionBar
+                      slices={slices}
+                      barWidth={barWidth()}
+                      value={prompt !== null ? formatTokens(prompt) : undefined}
+                      theme={theme}
+                    />
                   ) : (
                     <text fg={theme.text.faint} wrapMode="none" truncate selectable={false}>
-                      {`  ${rec.kind} call — no composition captured`}
+                      {`  ${rec.kind} call${
+                        prompt !== null ? ` — ${formatTokens(prompt)} prompt` : ""
+                      } — no composition captured`}
                     </text>
                   )}
+                  {/* A breathing line between the bar and its legend. */}
+                  <box height={1} flexShrink={0} />
                   {/* Legend: one row per slice. The glyph ties each row to its
                       segment of the bar; tokens and share carry the numbers. */}
                   <For each={slices}>
@@ -872,15 +853,18 @@ function Panel(props: { context: Context; panel: PanelInput }) {
                       {`  ${status.text}`}
                     </text>
                   )}
-                  {prompt !== null && (
+                  {/* The call's other side: the bar's row carries the prompt
+                      figure, so this row is completion and the cache it read. */}
+                  {completion !== null && (
                     <text wrapMode="none" truncate selectable={false}>
-                      <span style={{ fg: theme.text.base, bold: true }}>{`${formatTokens(prompt)} prompt`}</span>
-                      <span style={{ fg: theme.text.muted }}>
-                        {` · ${completion === null ? "···" : formatTokens(completion)} completion`}
-                        {cacheRead !== null && cacheRead > 0
-                          ? ` · ${formatTokens(cacheRead)} cache (${Math.round(cacheHit * 100)}%)`
-                          : ""}
+                      <span style={{ fg: theme.text.base, bold: true }}>
+                        {`${formatTokens(completion)} completion`}
                       </span>
+                      {cacheRead !== null && cacheRead > 0 && (
+                        <span style={{ fg: theme.text.muted }}>
+                          {` · ${formatTokens(cacheRead)} cache (${Math.round(cacheHit * 100)}%)`}
+                        </span>
+                      )}
                     </text>
                   )}
                   {/* Free space: the window's complement of the served prompt,
@@ -912,50 +896,119 @@ function Panel(props: { context: Context; panel: PanelInput }) {
               )
             }}
           </Show>
+
+          <SectionRule label="trend" width={contentWidth} summary={trendSummary} theme={theme} />
+
+          {/* Trend: one cell per request, latest at the right, full width —
+              the window figure rides the divider above, so the strip gets the
+              whole line. Block height is the window share; the selected cell
+              is bold, and the marker row below points at it (^) and at
+              compaction events (~) — shape and markers, not hue, carry the
+              meaning on any theme. */}
+          <text wrapMode="none" truncate flexShrink={0} minWidth={0} selectable={false}>
+            {trend().map((cell, i) => {
+              const isLatest = i === trend().length - 1
+              const isSelected = cell.seq === (current()?.seq ?? -1)
+              const color = isSelected
+                ? theme.hue.interactive[500]
+                : isLatest
+                  ? theme.hue.accent[500]
+                  : theme.text.faint
+              return (
+                <span style={{ fg: color, bold: isSelected }}>{cell.char}</span>
+              )
+            })}
+          </text>
+          <text wrapMode="none" truncate flexShrink={0} minWidth={0} selectable={false}>
+            {trend().map((cell) => {
+              if (cell.seq === (current()?.seq ?? -1))
+                return (
+                  <span style={{ fg: theme.text.base, bold: true }}>^</span>
+                )
+              if (cell.kind === "compaction")
+                return (
+                  <span style={{ fg: theme.text.faint }}>~</span>
+                )
+              return " "
+            })}
+          </text>
+
+          <SectionRule label="requests" width={contentWidth} summary={requestsSummary} theme={theme} />
+
+          {/* Request list: the session's calls, oldest at the top. A header
+              row names the columns, and every column is fixed width — seq,
+              kind, right-aligned tokens, mini gauge — so the columns stay
+              aligned whether a figure is present or a placeholder. */}
+          <text fg={theme.text.faint} wrapMode="none" truncate flexShrink={0} minWidth={0} selectable={false}>
+            {LIST_HEADER}
+          </text>
+          <scrollbox
+            ref={(value) => {
+              list = value
+            }}
+            scrollY
+            flexGrow={1}
+            width="100%"
+            minHeight={0}
+            minWidth={0}
+          >
+            <box flexDirection="column" minWidth={0}>
+              <For each={records()}>
+                {(rec, index) => {
+                  const selectedHere = index() === selection()
+                  const f = fill(rec)
+                  const kind =
+                    rec.kind === "primary"
+                      ? "primary"
+                      : rec.kind === "compaction"
+                        ? "compact"
+                        : rec.kind === "title"
+                          ? "title"
+                          : rec.kind.slice(0, 7)
+                  const prompt = estimate(rec).prompt
+                  const filled =
+                    f === null ? 0 : Math.min(LIST_FILL_WIDTH, Math.round(f * LIST_FILL_WIDTH))
+                  const mini =
+                    f === null
+                      ? "·".repeat(LIST_FILL_WIDTH)
+                      : "▇".repeat(filled) + "░".repeat(LIST_FILL_WIDTH - filled)
+                  // The selected row takes base + bold (and the raised surface);
+                  // non-primary kinds recede to faint so the primary calls read
+                  // as the list's spine. The mini gauge carries the window
+                  // fill, so no separate percentage column.
+                  const rowFg = selectedHere ? theme.text.base : theme.text.muted
+                  return (
+                    <box
+                      id={`wc-row-${rec.seq}`}
+                      height={1}
+                      minWidth={0}
+                      backgroundColor={selectedHere ? theme.background.raised.high : undefined}
+                      onMouseDown={(event) => {
+                        if (event.button !== MouseButton.LEFT) return
+                        select(index())
+                      }}
+                    >
+                      <text
+                        fg={rowFg}
+                        attributes={selectedHere ? TextAttributes.BOLD : undefined}
+                        wrapMode="none"
+                        truncate
+                        selectable={false}
+                      >
+                        {`${selectedHere ? "▸" : " "}#${String(rec.seq).padStart(4, "0")}  `}
+                        <span style={{ fg: selectedHere ? rowFg : rec.kind === "primary" ? theme.text.muted : theme.text.faint }}>
+                          {kind.padEnd(LIST_KIND_WIDTH)}
+                        </span>
+                        {`  ${(prompt === null ? "·····" : formatTokens(prompt)).padStart(LIST_TOKEN_WIDTH)}  ${mini}`}
+                      </text>
+                    </box>
+                  )
+                }}
+              </For>
+            </box>
+          </scrollbox>
         </box>
       </Show>
-
-      {/* Trend: one cell per request, latest at the right. Block height is
-          the window share; the selected cell is bold, and the marker row
-          below points at it (^) and at compaction events (~) — shape and
-          markers, not hue, carry the meaning on any theme. */}
-      <box flexDirection="row" gap={1} height={1} flexShrink={0} minWidth={0}>
-        <text fg={theme.text.faint} wrapMode="none" flexShrink={0} selectable={false}>
-          {trendLabel()}
-        </text>
-        <text wrapMode="none" truncate flexGrow={1} minWidth={0} selectable={false}>
-          {trend().map((cell, i) => {
-            const isLatest = i === trend().length - 1
-            const isSelected = cell.seq === (current()?.seq ?? -1)
-            const color = isSelected
-              ? theme.hue.interactive[500]
-              : isLatest
-                ? theme.hue.accent[500]
-                : theme.text.faint
-            return (
-              <span style={{ fg: color, bold: isSelected }}>{cell.char}</span>
-            )
-          })}
-        </text>
-      </box>
-      <box flexDirection="row" gap={1} height={1} flexShrink={0} minWidth={0}>
-        <text wrapMode="none" flexShrink={0} selectable={false}>
-          {" ".repeat(trendLabel().length)}
-        </text>
-        <text wrapMode="none" truncate flexGrow={1} minWidth={0} selectable={false}>
-          {trend().map((cell) => {
-            if (cell.seq === (current()?.seq ?? -1))
-              return (
-                <span style={{ fg: theme.text.base, bold: true }}>^</span>
-              )
-            if (cell.kind === "compaction")
-              return (
-                <span style={{ fg: theme.text.faint }}>~</span>
-              )
-            return " "
-          })}
-        </text>
-      </box>
 
       {/* Footer: key help. */}
       <box flexDirection="row" gap={1} height={1} flexShrink={0} minWidth={0}>
@@ -968,17 +1021,59 @@ function Panel(props: { context: Context; panel: PanelInput }) {
 }
 
 /**
+ * A one-line section divider, in btop's heading style: a faint dash run, a
+ * bold embedded label, a faint rule to the edge, and an optional summary
+ * figure right-aligned at the rule's end — btop carries its clock and update
+ * rate on the box's top border, and its table a row count, the same
+ * heading-then-headline-figure shape. The rule is a shape, not a hue, so it
+ * survives a monochrome terminal.
+ *
+ * @param props - The section's label, the rule's available width, and the
+ *   summary figure (or nothing).
+ * @returns The divider row.
+ */
+function SectionRule(props: {
+  label: string
+  width: () => number
+  summary?: () => string
+  theme: Context["theme"]
+}) {
+  const { theme } = props
+  const PREFIX = 8
+  return (
+    <text height={1} wrapMode="none" truncate flexShrink={0} selectable={false}>
+      <span style={{ fg: theme.text.faint }}>{"─".repeat(PREFIX)}</span>
+      <span style={{ fg: theme.text.base, bold: true }}>{props.label}</span>
+      <span
+        style={{ fg: theme.text.faint }}
+      >{
+        "─".repeat(
+          Math.max(0, props.width() - PREFIX - props.label.length - (props.summary?.() ? props.summary()!.length + 1 : 0)),
+        )
+      }</span>
+      <Show when={props.summary?.()}>
+        {(summary) => (
+          <span style={{ fg: theme.text.muted }}>{` ${summary()}`}</span>
+        )}
+      </Show>
+    </text>
+  )
+}
+
+/**
  * The prompt of one request as a single stacked bar: each segment spans its
  * share of the prompt's rendered bytes, and each slice's block glyph marks its
  * identity. The four block densities separate the slices on any theme; the
- * house hues color them where the terminal has color.
+ * house hues color them where the terminal has color. The prompt total
+ * follows the bar's end — btop never draws a bar without its value beside it.
  *
- * @param props - The row's data.
+ * @param props - The row's data, and the prompt figure the bar measures.
  * @returns The stacked bar row.
  */
 function CompositionBar(props: {
   slices: SliceView[]
   barWidth: number
+  value?: string
   theme: Context["theme"]
 }) {
   const { theme } = props
@@ -1012,6 +1107,9 @@ function CompositionBar(props: {
       {cells.map((cell) => (
         <span style={{ fg: cell.fg }}>{cell.char}</span>
       ))}
+      {props.value !== undefined && (
+        <span style={{ fg: theme.text.base, bold: true }}>{` ${props.value}`}</span>
+      )}
     </text>
   )
 }
