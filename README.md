@@ -38,6 +38,19 @@ that gap through the [plugin API](https://opencode.ai/docs/plugins/) session hoo
 `/what-context` command is named to sit beside, not collide with, the community plugin's
 `/context`.
 
+## Development
+
+To work on the plugin from a clone, install the dependencies and generate the local loader:
+
+```sh
+npm install
+scripts/dev-link.sh
+```
+
+The loader in `.opencode/plugins/` is generated, not tracked: OpenCode discovers it
+automatically, so a session started in the repo runs the checkout's `src/` live (a running
+service reloads it on save).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

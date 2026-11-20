@@ -4,9 +4,8 @@ AGENTS.md.backup.*
 CLAUDE.md
 CLAUDE.md.backup.*
 
-# Local OpenCode config, except the committed plugin loader shim
-.opencode/*
-!.opencode/plugins/
+# Local OpenCode config and the generated plugin loader (scripts/dev-link.sh)
+.opencode/
 
 # TypeScript
 node_modules/
