@@ -1,0 +1,32 @@
+# CI gate for the public package: the npm package ships src/ as raw TypeScript,
+# so a broken build is a broken install for every `opencode plugin add`.
+#
+# Author: Alister Lewis-Bowen <alister@lewis-bowen.org>
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Type check
+        run: npm run check
