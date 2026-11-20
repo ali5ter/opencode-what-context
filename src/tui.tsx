@@ -1,11 +1,14 @@
 /** @jsxImportSource @opentui/solid */
 /**
- * opencode-what-context — build step 3: the TUI panel.
+ * opencode-what-context — build step 3 (TUI panel) and step 4 (display).
  *
  * Renders the server part's per-call records in the session panel: a
  * context-window gauge, a request list with a per-call mini gauge, a
- * four-slice composition detail (the E2w' estimator, `estimate.ts`), and
- * a trend strip across the session's requests.
+ * four-slice composition detail (the E2w' estimator, `estimate.ts`) with
+ * per-source, per-part, and per-tool breakdowns, a free-space row, and a
+ * trend strip across the session's requests. Step 4 adds the prompt-footer
+ * context-window indicator, which reads the client's synced session state
+ * directly and never touches the captured records.
  *
  * The records come over the `what-context` RPC (`rpc.ts`) — the TUI process
  * cannot read the server's plugin storage — and each `recorded` event triggers
@@ -25,8 +28,9 @@
  */
 
 import { Plugin } from "@opencode/plugin/tui"
-import type { Context, PanelInput } from "@opencode/plugin/tui/context"
+import type { Context, PanelInput, SlotMap } from "@opencode/plugin/tui/context"
 import type { LocationRef } from "@opencode/client"
+import { lastAssistantWithUsage } from "@opencode/client/solid"
 import type { RGBA, ScrollBoxRenderable } from "@opentui/core"
 import { MouseButton, TextAttributes } from "@opentui/core"
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
@@ -49,6 +53,9 @@ const BAR_WIDTH = 20
 
 /** Header gauge width in cells. */
 const GAUGE_CELLS = 10
+
+/** The prompt-footer indicator's gauge width in cells. */
+const FOOTER_GAUGE_CELLS = 10
 
 /** Trend strip: at most this many recent requests. */
 const TREND_MAX = 40
@@ -135,6 +142,35 @@ function errorText(err: unknown): string {
     if (typeof message === "string" && message.length > 0) return message
   }
   return String(err)
+}
+
+/** The UTF-8 encoder, shared by the byte measurements. */
+const encoder = new TextEncoder()
+
+/**
+ * Byte length of a UTF-8 string.
+ *
+ * @param text - The string to measure.
+ * @returns The number of UTF-8 bytes.
+ */
+function utf8(text: string): number {
+  return encoder.encode(text).length
+}
+
+/**
+ * The gauge color at a context-window fill: teal, then purple, then warning,
+ * then error past the window. Shared by the panel's gauges and the footer
+ * indicator.
+ *
+ * @param f - The fill ratio, unbounded above 1.
+ * @param theme - The resolved theme.
+ * @returns The gauge color.
+ */
+function gaugeColor(f: number, theme: Context["theme"]): RGBA {
+  if (f > 1) return theme.text.feedback.error.base
+  if (f >= 0.85) return theme.text.feedback.warning.base
+  if (f >= 0.7) return theme.hue.interactive[500]
+  return theme.hue.accent[400]
 }
 
 /**
@@ -251,6 +287,45 @@ function partTypeViews(rec: CallView): PartTypeView[] {
     tokens: messages !== undefined && messages.tokens !== null ? Math.round(messages.tokens * (entry.rendered / content)) : null,
   }))
   return views.sort((a, b) => (b.tokens ?? -1) - (a.tokens ?? -1))
+}
+
+/**
+ * One tool schema as a sub-row of the tools slice.
+ */
+interface ToolView {
+  /** The tool name, e.g. `read`. */
+  readonly name: string
+  /** The tool's share of the tools slice (0..1), by rendered bytes. */
+  readonly share: number
+  /** Estimated tokens, or null when no usage has landed. */
+  readonly tokens: number | null
+}
+
+/**
+ * The tool schemas of a record, largest first. The per-tool rendered size
+ * mirrors the capture's tools total (description + schema + name bytes) so
+ * the shares sum to the slice.
+ *
+ * @param rec - The stored per-call record.
+ * @returns The per-tool views, or empty when the composition has no tools.
+ */
+function toolViews(rec: CallView): ToolView[] {
+  const composition = rec.composition
+  if (composition === null || composition.totals.toolsRendered <= 0) return []
+  const tools = estimate(rec).slices.find((s) => s.name === "tools")
+  const total = composition.totals.toolsRendered
+  const views = composition.tools.map((tool) => {
+    const rendered = Math.max(0, tool.descRendered + tool.schemaRendered + utf8(tool.name))
+    return {
+      name: tool.name,
+      share: total > 0 ? rendered / total : 0,
+      tokens:
+        tools !== undefined && tools.tokens !== null
+          ? Math.round((tools.tokens * rendered) / total)
+          : null,
+    }
+  })
+  return views.sort((a, b) => b.share - a.share)
 }
 
 /**
@@ -445,20 +520,6 @@ function Panel(props: { context: Context; panel: PanelInput }) {
     return prompt / window
   }
 
-  /**
-   * The color of a gauge at a given fill: teal, then purple, then warning,
-   * then error past the window.
-   *
-   * @param f - The fill ratio.
-   * @returns The gauge color.
-   */
-  function gaugeColor(f: number): RGBA {
-    if (f > 1) return theme.text.feedback.error.base
-    if (f >= 0.85) return theme.text.feedback.warning.base
-    if (f >= 0.7) return theme.hue.interactive[500]
-    return theme.hue.accent[400]
-  }
-
   const modelLabel = createMemo(() => {
     const rec = current()
     return rec === undefined ? "" : `${rec.model.providerID}/${rec.model.id}`
@@ -579,7 +640,7 @@ function Panel(props: { context: Context; panel: PanelInput }) {
     const cells = "▇".repeat(filled) + (over ? "!" : "░".repeat(Math.max(0, GAUGE_CELLS - filled)))
     return {
       cells,
-      color: gaugeColor(f),
+      color: gaugeColor(f, theme),
       label: over ? ">100%" : `${Math.round(f * 100)}%`,
     }
   })
@@ -723,6 +784,7 @@ function Panel(props: { context: Context; panel: PanelInput }) {
               const slices = sliceViews(rec)
               const sources = sourceViews(rec)
               const parts = partTypeViews(rec)
+              const tools = toolViews(rec)
               const status = statusLine(rec, theme.text.feedback.warning.base, theme.text.feedback.info.base, theme.text.feedback.error.base)
               const est = estimate(rec)
               const messages = rec.composition?.messages ?? []
@@ -787,6 +849,24 @@ function Panel(props: { context: Context; panel: PanelInput }) {
                       </For>
                     </box>
                   )}
+                  {/* Per-tool sub-rows: which schemas spend the tools slice.
+                      Same shape as the system and message blocks. */}
+                  {tools.length > 0 && (
+                    <box flexDirection="column">
+                      <text fg={theme.text.faint} wrapMode="none" truncate selectable={false}>
+                        {`  tools — % of tools · ${toolCount} tools`}
+                      </text>
+                      <For each={tools.slice(0, 5)}>
+                        {(tool) => (
+                          <text wrapMode="none" truncate selectable={false}>
+                            <span style={{ fg: theme.text.muted }}>{`    ${tool.name.slice(0, 20)}`.padEnd(25)}</span>
+                            <span style={{ fg: theme.text.base }}>{tool.tokens === null ? "·····" : formatTokens(tool.tokens).padStart(6)}</span>
+                            <span style={{ fg: theme.text.muted }}>{` ${Math.round(tool.share * 100)}%`}</span>
+                          </text>
+                        )}
+                      </For>
+                    </box>
+                  )}
                   {status !== null && (
                     <text fg={status.color} attributes={TextAttributes.BOLD} wrapMode="none" truncate selectable={false}>
                       {`  ${status.text}`}
@@ -801,6 +881,31 @@ function Panel(props: { context: Context; panel: PanelInput }) {
                           ? ` · ${formatTokens(cacheRead)} cache (${Math.round(cacheHit * 100)}%)`
                           : ""}
                       </span>
+                    </text>
+                  )}
+                  {/* Free space: the window's complement of the served prompt,
+                      the gauge's number made explicit. The window memo is
+                      reactive, so the row appears when a usage lands. */}
+                  {prompt !== null && windowSize() !== undefined && (
+                    <text wrapMode="none" truncate selectable={false}>
+                      {(() => {
+                        const window = windowSize()
+                        if (window === undefined) return null
+                        const free = window - prompt
+                        if (free < 0)
+                          return (
+                            <span style={{ fg: theme.text.feedback.error.base, bold: true }}>
+                              {`over by ${formatTokens(-free)}`}
+                            </span>
+                          )
+                        const f = window > 0 ? prompt / window : 1
+                        return (
+                          <>
+                            <span style={{ fg: gaugeColor(f, theme), bold: true }}>{formatTokens(free)}</span>
+                            <span style={{ fg: theme.text.muted }}>{` free`}</span>
+                          </>
+                        )
+                      })()}
                     </text>
                   )}
                 </box>
@@ -912,11 +1017,88 @@ function CompositionBar(props: {
 }
 
 /**
- * The app-scope contribution: the `/context` slash command, the palette
- * entry, and the `<leader>v` keybind that open or close the panel.
+ * The `prompt.footer.status` slot: a context-window indicator on the prompt
+ * bar, where the Claude Code prompt bar shows its context fill. It reads the
+ * client's synced session state directly, like the host's own footer:
+ * `lastAssistantWithUsage` picks the latest completed step after the last
+ * compaction and before the revert boundary, and the model's registered
+ * `limit.context` supplies the window — reactive, with no captured records
+ * and no RPC.
+ *
+ * The host's own footer already shows the *consumed* tokens and cost as
+ * numbers in the same row, so this shows the complement instead: a
+ * glyph-density gauge of the window plus the *free* space (or the overrun),
+ * in the panel's gauge colors — the visual channel, not a third number.
+ * Appended inside the status slot, it stays one line and yields in shell
+ * mode and when the host hides details.
+ *
+ * @param props - The plugin context, plus the slot's input.
+ * @returns The indicator, or nothing when the prompt has no session, is in
+ *   shell mode, the host hides details, or no usage has landed yet.
+ */
+function StatusIndicator(props: { context: Context; input: SlotMap["prompt.footer.status"] }) {
+  const { data } = props.context
+  const theme = props.context.theme
+  const usage = createMemo(() => {
+    if (!props.input.sessionID || props.input.mode === "shell" || !props.input.showDetails) return null
+    const session = data.session.get(props.input.sessionID)
+    if (!session) return null
+    const step = lastAssistantWithUsage(
+      data.session.message.list(props.input.sessionID),
+      session.revert?.messageID,
+    )
+    if (!step) return null
+    const tokens = step.tokens
+    // On every lane the served prompt is input + the cache split (ollama
+    // reports Anthropic-style: input is the uncached remainder; the openai
+    // lanes report input as the full prompt and cache zero) — the same number
+    // the panel's gauges use.
+    const prompt = tokens.input + tokens.cache.read + tokens.cache.write
+    if (prompt <= 0) return null
+    const models = data.location.model.list(session.location) ?? []
+    const model = models.find(
+      (m) => m.providerID === step.model.providerID && m.id === step.model.id,
+    )
+    const window = model?.limit.context
+    if (window === undefined || window <= 0) return null
+    const f = prompt / window
+    const filled = Math.min(FOOTER_GAUGE_CELLS, Math.max(1, Math.round(f * FOOTER_GAUGE_CELLS)))
+    const cells = "▇".repeat(filled) + "░".repeat(Math.max(0, FOOTER_GAUGE_CELLS - filled))
+    const free = window - prompt
+    return { f, cells, free }
+  })
+  return (
+    <Show when={usage()} keyed>
+      {(u) => (
+        <box flexDirection="row" gap={1} flexShrink={0} minWidth={0}>
+          <text fg={theme.text.faint} wrapMode="none" truncate selectable={false}>
+            ctx
+          </text>
+          <text wrapMode="none" truncate selectable={false}>
+            <span style={{ fg: gaugeColor(u.f, theme), bold: true }}>{u.cells}</span>
+            <span
+              style={
+                u.free < 0
+                  ? { fg: theme.text.feedback.error.base, bold: true }
+                  : { fg: gaugeColor(u.f, theme), bold: true }
+              }
+            >
+              {` ${u.free < 0 ? `over by ${formatTokens(-u.free)}` : `${formatTokens(u.free)} free`}`}
+            </span>
+          </text>
+        </box>
+      )}
+    </Show>
+  )
+}
+
+/**
+ * The app-scope contribution: the `/what-context` slash command, the palette
+ * entry, the `<leader>v` keybind that open or close the panel, and the
+ * prompt-footer context indicator.
  *
  * @param props - The plugin context.
- * @returns Nothing; the component only registers the keymap layer.
+ * @returns Nothing; the component only registers the keymap and slot layers.
  */
 function Commands(props: { context: Context }) {
   const { context } = props
@@ -927,7 +1109,7 @@ function Commands(props: { context: Context }) {
         id: "what-context.open",
         title: "Open context panel",
         description: "Show what was sent to the model, request by request",
-        slash: { name: "context" },
+        slash: { name: "what-context" },
         group: "Context",
         palette: true,
         bind: "<leader>v",
@@ -962,6 +1144,10 @@ export default Plugin.define({
     context.ui.slot({
       append: "app",
       render: () => <Commands context={context} />,
+    })
+    context.ui.slot({
+      append: "prompt.footer.status",
+      render: (input) => <StatusIndicator context={context} input={input} />,
     })
   },
 })

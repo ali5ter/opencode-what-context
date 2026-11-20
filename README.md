@@ -9,20 +9,22 @@ Every time OpenCode calls a model, the plugin records what went out. Agent-loop 
 assembled context — system instructions by source, tool schemas, and conversation; every call
 also carries the wire body size and the provider's reported usage. In the TUI the records render
 as a [dsh-context](https://github.com/bowenliang123/dsh-context)-style panel: a context-window
-gauge, a request history, a per-request composition bar, and a token trend.
+gauge, a request history, a per-request composition bar with per-source, per-part, and per-tool
+breakdowns, a token trend, and the free space in the window. The prompt bar always carries a
+context-window indicator, so the session's fill is visible without opening the panel.
 
 ## Install
 
 ```sh
-opencode plugin add github:ali5ter/opencode-what-context
+opencode plugin add opencode-what-context
 ```
 
-The package is installed from the Git repository on first start, so restart OpenCode afterwards.
+The package is installed from the npm registry on first start, so restart OpenCode afterwards.
 
 ## Usage
 
-Open the panel in the TUI with the `/context` command or the `<leader>v` keybinding. Use `j`/`k`
-to move through the request history, `f` to toggle fullscreen, and `q` to close.
+Open the panel in the TUI with the `/what-context` command or the `<leader>v` keybinding. Use
+`j`/`k` to move through the request history, `f` to toggle fullscreen, and `q` to close.
 
 ## Why
 
@@ -32,7 +34,9 @@ served request body. A community `/context` plugin —
 answers *how many*: token totals by category, cache hit rate, cost, including delegated subagents.
 Nothing answers *what*: the served request body is not persisted, so the composition of the
 context (system instructions, tool schemas, conversation) stays invisible. This plugin closes
-that gap through the [plugin API](https://opencode.ai/docs/plugins/) session hooks.
+that gap through the [plugin API](https://opencode.ai/docs/plugins/) session hooks — and its
+`/what-context` command is named to sit beside, not collide with, the community plugin's
+`/context`.
 
 ## License
 

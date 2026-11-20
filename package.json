@@ -1,6 +1,6 @@
 {
   "name": "opencode-what-context",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "An OpenCode plugin that shows what was sent to the model, request by request.",
   "type": "module",
   "exports": {
@@ -16,6 +16,7 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
+    "@opencode/client": "2.3.0",
     "@opencode/plugin": "2.3.0",
     "@opentui/core": "0.8.4",
     "@opentui/solid": "0.8.4",
