@@ -39,38 +39,33 @@ Show
 Type "opencode"
 Sleep 400ms
 Enter
-Sleep 12s
+Sleep 6s
 
 # Two short prompts; each one is a captured request.
 Type "Reply with exactly: one"
 Sleep 300ms
 Enter
-Sleep 10s
+Sleep 8s
 Type "Reply with exactly: two"
 Sleep 300ms
 Enter
-Sleep 8s
+Sleep 5s
 
 # Open the panel.
 Type "/what-context"
 Sleep 500ms
 Enter
-Sleep 3s
+Sleep 10s
 
 # Walk the request list; the context box follows the selection.
 Type "k"
-Sleep 1.5s
-Type "k"
-Sleep 1.5s
-Type "j"
-Sleep 1.5s
-Type "j"
-Sleep 1.5s
-
-# Fullscreen and back; closing leaves the footer indicator on the prompt bar.
-Type "f"
-Sleep 3s
-Type "f"
 Sleep 2s
+Type "k"
+Sleep 3s
+Type "j"
+Sleep 2
+Type "j"
+Sleep 5s
+
 Type "q"
 Sleep 2s
