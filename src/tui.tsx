@@ -155,9 +155,14 @@ function tee(index: number, count: number): string {
 
 /**
  * A section box's native title: the label, and the summary figure padded to
- * sit one cell inside the border's right corner. The native box title is one
- * string of one color, so label and figure share the heading's step; the box
- * shape, not the hue, carries the structure.
+ * sit inside the border's right corner. The native box title is one string of
+ * one color drawn on the top border, inset one cell from each corner — and
+ * the native renderer drops the title entirely (it never clips) when the
+ * string is longer than that inset area, so the string must be at most the
+ * box's width minus four cells: the two corners and the two inset cells. The
+ * leading and trailing spaces lift the text off the border dashes. The
+ * native title is one string of one color, so label and figure share the
+ * heading's step; the box shape, not the hue, carries the structure.
  *
  * @param label - The section's label.
  * @param width - The box's outer width in cells.
@@ -165,9 +170,9 @@ function tee(index: number, count: number): string {
  * @returns The title string.
  */
 function boxTitle(label: string, width: number, summary: string): string {
-  if (summary.length === 0) return label
-  const spaces = Math.max(1, width - 3 - label.length - summary.length)
-  return `${label}${" ".repeat(spaces)}${summary}`
+  if (summary.length === 0) return ` ${label} `
+  const spaces = Math.max(1, width - 4 - label.length - summary.length - 2)
+  return ` ${label}${" ".repeat(spaces)}${summary} `
 }
 
 /**
@@ -741,7 +746,7 @@ function Panel(props: { context: Context; panel: PanelInput }) {
           </box>
         }
       >
-        <box flexDirection="column" flexGrow={1} minHeight={0} minWidth={0} gap={1}>
+        <box flexDirection="column" flexGrow={1} minHeight={0} minWidth={0} gap={0}>
           {/* Context: the selected request's composition, in a btop-style box.
               The border carries the model (the box's only label — a bare
               "context" would say nothing the panel does not), and the detail
