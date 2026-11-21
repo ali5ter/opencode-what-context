@@ -6,7 +6,10 @@
  *
  * - `context` (primary calls only) supplies the composition: per-source system parts,
  *   per-part messages, and per-tool schema sizes, each with raw UTF-8 bytes and
- *   JSON-rendered bytes (the bytes the wire body spends on that part).
+ *   JSON-rendered bytes (the bytes the wire body spends on that part). The agent
+ *   entries of a `subagent`-style tool's description are parsed at capture time
+ *   (names and sizes only, in any mode) so the panel can break the tool down per
+ *   agent without persisting the description itself.
  * - `http.request` supplies the wire body size (overhead cross-check) and consumes the
  *   pending composition. Pairing is by session plus fire-time ordering — a pending
  *   composition queue per session, consumed by the next `primary` request — never by
@@ -45,6 +48,7 @@ import type {
   MessageShape,
   PartShape,
   SourceShape,
+  SubagentShape,
   SystemShape,
   TokensShape,
   ToolShape,
@@ -237,10 +241,42 @@ function composeMessages(messages: unknown): MessageShape[] {
 }
 
 /**
+ * Parse the agent entries of a `subagent`-style tool description.
+ *
+ * OpenCode renders the available agents into the tool's description as one
+ * `- name: description` line each, after an "Available subagents" marker line.
+ * Each line is measured at its own size (raw and JSON-rendered), a
+ * sub-breakdown of the description it came from, and stored in any mode —
+ * names and sizes, never the entry texts, so lightweight records stay
+ * lightweight.
+ *
+ * @param description - The tool's description text.
+ * @returns One entry per agent line, in list order, or empty when the
+ *   description carries no agent list (the format may differ by version).
+ */
+function parseSubagents(description: string): SubagentShape[] {
+  const lines = description.split("\n")
+  const start = lines.findIndex((line) => /^available (sub-?agents?|agents)\b/i.test(line.replace(/[*_#`]/g, "").trim()))
+  if (start < 0) return []
+  const out: SubagentShape[] = []
+  for (let i = start + 1; i < lines.length; i++) {
+    const match = /^-\s*([^:\s][^:]*?)\s*:(.*)$/.exec(lines[i].trim())
+    if (match === null) break
+    out.push({
+      name: match[1].trim(),
+      bytes: utf8(lines[i]),
+      rendered: Math.max(0, rendered(lines[i]) - 2),
+    })
+  }
+  return out
+}
+
+/**
  * Build the per-tool shapes.
  *
  * @param tools - The tools record as fired by OpenCode.
- * @returns One shape per tool: description and schema sizes.
+ * @returns One shape per tool: description and schema sizes, plus the parsed
+ *   agent entries when the description carries a subagent list.
  */
 function composeTools(tools: Record<string, { description: string; input: unknown }>): ToolShape[] {
   return Object.entries(tools).map(([name, tool]) => {
@@ -253,6 +289,8 @@ function composeTools(tools: Record<string, { description: string; input: unknow
       schemaBytes: rendered(schema),
       schemaRendered: rendered(schema),
     }
+    const subagents = parseSubagents(description)
+    if (subagents.length > 0) out.subagents = subagents
     if (FULL) {
       out.description = description
       out.schema = schema

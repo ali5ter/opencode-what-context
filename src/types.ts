@@ -45,6 +45,16 @@ export interface MessageShape {
   parts: PartShape[]
 }
 
+/** One agent entry of the subagent tool's description list. */
+export interface SubagentShape {
+  /** The agent name, e.g. `explorer` or `over-50s-health/advisor`. */
+  name: string
+  /** The entry's raw UTF-8 bytes as carried in the description. */
+  bytes: number
+  /** The entry's JSON-rendered bytes (its share of the description's rendering). */
+  rendered: number
+}
+
 /** One tool entry of the request. */
 export interface ToolShape {
   name: string
@@ -52,6 +62,8 @@ export interface ToolShape {
   descRendered: number
   schemaBytes: number
   schemaRendered: number
+  /** The agent entries parsed from the description of a `subagent`-style tool. */
+  subagents?: SubagentShape[]
   description?: string
   schema?: unknown
 }
