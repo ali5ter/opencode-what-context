@@ -1,8 +1,8 @@
 # Demo reel: the what-context panel inside a live OpenCode session.
 #
 # A real session against a local model makes two short prompts (each is a
-# captured request), then the panel opens: the composition box (labelled by
-# the model, its first row the window-fill gauge), the trend strip, the
+# captured request), then the panel opens: the context box (labelled by the
+# model; usage grid, composition legend, response), the trend strip, the
 # request list. The walk ends on the prompt-footer indicator, which stays on
 # after the panel closes.
 #
