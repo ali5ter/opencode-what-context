@@ -7,6 +7,9 @@ CLAUDE.md.backup.*
 # Local OpenCode config and the generated plugin loader (scripts/dev-link.sh)
 .opencode/
 
+# Local mock of the what-context panel (untracked by request)
+context-usage-v3.py
+
 # TypeScript
 node_modules/
 dist/
