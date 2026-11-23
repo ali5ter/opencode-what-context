@@ -30,6 +30,29 @@ it again for the plugin to load.
 When in OpenCode, use the `/what-context` command (or the `<leader>v` keybinding) to open the panel.
 
 Click into the panel and use `j`/`k` to move through the request history, `f` to toggle fullscreen, and `q` to close.
+The three sections stack at their natural sizes; when the view is too short to show them all, the whole panel scrolls.
+
+## Reading the panel
+
+The context box depicts the context window: a grid of its cells, a figure line, and a
+legend with one row per window category (system, messages, tools, scaffolding, free space,
+and the auto-compact reserve). All numbers are tokens; the percentages are dimmed.
+
+Two legend rows expand into breakdowns: the system row into the system prompt's sections,
+and the messages row into the conversation's part types (text, tool results, reasoning).
+OpenCode assembles the system sections itself, so each row names a source rather than a
+file:
+
+| Row                   | What it is                                                                    | To reduce it                                                             |
+| --------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `core/skill-guidance` | The registered skills: id, name, and description of each                      | Disable or remove skills that are not used                               |
+| `core/instructions`   | The base system prompt plus every discovered instruction file, concatenated   | Trim the instruction files (global and project `AGENTS.md`, `CLAUDE.md`) |
+| `core/mcp-guidance`   | The instruction blocks served by the configured MCP servers                   | Disable the MCP servers that are not used                                |
+| `core/codemode` etc.  | OpenCode's fixed boilerplate (date, environment, tool guidance)               | Not configurable                                                         |
+
+The `core/instructions` row is one merged block, so it cannot by itself attribute tokens to a
+single file. OpenCode prefixes each file it folds in with an `Instructions from: {path}` line;
+to measure one file, move it aside, send one request, and read the row's difference.
 
 ## Why
 
