@@ -2,10 +2,10 @@
 /**
  * opencode-what-context — build step 3 (TUI panel) and step 4 (display).
  *
- * Renders the server part's per-call records in the session panel: a
- * four-slice composition detail (the E2w' estimator, `estimate.ts`) with a
- * window-fill gauge, a trend strip across the session's requests, and a
- * request list with a per-call mini gauge. Step 4 adds the prompt-footer
+ * Renders the server part's per-call records in the session panel: a context
+ * window grid with its composition legend (the E2w' estimator,
+ * `estimate.ts`), a trend strip across the session's requests, and a request
+ * list with a per-call mini gauge. Step 4 adds the prompt-footer
  * context-window indicator, which reads the client's synced session state
  * directly and never touches the captured records.
  *
@@ -16,22 +16,25 @@
  * The design must survive any theme: OpenCode generates its system theme from
  * the terminal's palette, and a monochrome terminal collapses every hue token
  * to the same gray. Information therefore rides on channels that survive any
- * theme — the luminance steps (text.base/muted/faint), glyph shape (block
- * densities, markers), and bold — while the house hues (accent for system,
- * interactive for messages, neutral for tools) remain decoration that reads
- * better on colored terminals.
+ * theme — the luminance steps (text.base/muted/faint), glyph shape (the
+ * filled/free/reserve window glyphs, markers), and bold — while the house
+ * hues (accent for system, interactive for messages, neutral for tools)
+ * remain decoration that reads better on colored terminals.
  *
  * Layout: three stacked btop-style boxes — each a rounded frame whose border
  * carries its label and, where the section has a headline figure, that figure
  * padded to the border's right end. The context box is labelled by the
- * selected record's model and its first row is the window-fill gauge; it is
- * content-sized (its height is the detail's row count) so the whole detail is
- * visible whenever the terminal can hold it, and it scrolls only when it
- * cannot. The detail's breakdown rows (system sources, message parts) hang as
- * `tree`-style `├──`/`└──` branches beneath their slice's legend row; tool
- * names and the subagent list stay out of the panel. The trend strip sits
- * between the context and the request list, which grows to fill the remaining
- * space and scrolls.
+ * selected record's model and depicts the context window as a grid of single-
+ * width glyphs — one filled glyph for every used category (the house hue
+ * carries the category), the four-corner glyph for free space, and the
+ * squared-saltire glyph for the auto-compact reserve — filled in reading
+ * order, with a dot-leader legend beneath it; it is content-sized (its height
+ * is the detail's row count) so the whole detail is visible whenever the
+ * terminal can hold it, and it scrolls only when it cannot. The system
+ * breakdown rows hang as `tree`-style `├`/`└` branches beneath the system
+ * legend row; tool names and the subagent list stay out of the panel. The
+ * trend strip sits between the context and the request list, which grows to
+ * fill the remaining space and scrolls.
  *
  * Author: Alister Lewis-Bowen <alister@lewis-bowen.org>
  */
@@ -42,20 +45,29 @@ import type { LocationRef } from "@opencode/client"
 import { lastAssistantWithUsage } from "@opencode/client/solid"
 import type { RGBA, ScrollBoxRenderable } from "@opentui/core"
 import { MouseButton, TextAttributes } from "@opentui/core"
-import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import { For, Show, createEffect, createMemo, createSignal, on, onCleanup } from "solid-js"
 import { realpathSync } from "node:fs"
-import { estimate, type SliceName } from "./estimate"
+import { estimate } from "./estimate"
 import { WhatContext } from "./rpc"
 import type { CallView } from "./types"
+import {
+  BUFFER_DEFAULT_SHARE,
+  BUFFER_MIN,
+  GRID_ROWS,
+  contextDetail,
+  formatTokens,
+  parseCompaction,
+  spanColor,
+  type CompactionConfig,
+  type ContextDetail,
+  type DetailSpan,
+} from "./context"
 
 /** The content name the panel slot publishes for this plugin. */
 const NAME = "what-context"
 
-/** Detail bars are at most this many cells. */
-const BAR_WIDTH = 32
-
-/** Header gauge width in cells. */
-const GAUGE_CELLS = 10
+/** The plugin's version, shown in the panel header. Keep in sync with package.json. */
+const VERSION = "0.3.1"
 
 /** The prompt-footer indicator's gauge width in cells. */
 const FOOTER_GAUGE_CELLS = 10
@@ -83,74 +95,35 @@ const LIST_KIND_WIDTH = 7
 const LIST_TOKEN_WIDTH = 6
 const LIST_FILL_WIDTH = 8
 
-/** A breakdown sub-block shows at most this many rows, then a `… +N more` row. */
-const SUB_MAX_ROWS = 5
-
-/** A breakdown sub-row's name column width, shared by all four blocks. */
-const SUB_NAME_WIDTH = 22
-
-/** The list's header row: a label under each column, btop-style. */
-const LIST_HEADER =
-  " " +
-  "#seq".padEnd(5) +
-  "  " +
-  "kind".padEnd(LIST_KIND_WIDTH) +
-  "  " +
-  "tokens".padStart(LIST_TOKEN_WIDTH) +
-  "  " +
-  "window".padEnd(LIST_FILL_WIDTH)
+/**
+ * A request row's fixed cells, the gauge excluded: marker, seq, gaps, kind,
+ * and tokens. The mini gauge takes whatever the box's inner width leaves,
+ * capped at {@link LIST_FILL_WIDTH}, so no row ever overflows the box.
+ */
+const LIST_FIXED_WIDTH = 8 + LIST_KIND_WIDTH + 2 + LIST_TOKEN_WIDTH + 2
 
 /**
- * One block glyph per slice, in wire-body order. The four block densities are
- * the channel that separates the slices of the stacked composition bar on any
- * theme; the house hues only decorate them.
+ * The list's header row: a label under each column, btop-style. The window
+ * label matches the gauge's *current* width so the two stay aligned when the
+ * gauge shrinks in a narrow box.
  */
-const SLICE_GLYPH: Record<SliceName, string> = {
-  system: "█",
-  messages: "▓",
-  tools: "▒",
-  scaffolding: "░",
+function listHeader(fill: number): string {
+  const label = fill >= 6 ? "window".padEnd(fill) : "window".slice(0, Math.max(0, fill))
+  return (
+    " " +
+    "#seq".padEnd(5) +
+    "  " +
+    "kind".padEnd(LIST_KIND_WIDTH) +
+    "  " +
+    "tokens".padStart(LIST_TOKEN_WIDTH) +
+    "  " +
+    label
+  )
 }
 
-/**
- * The decoration color of one slice: the house hues where the terminal has
- * them, and the faint step for scaffolding, which is deliberately the
- * quietest. On a monochrome terminal the hues may collapse to gray; the block
- * glyphs keep the slices apart.
- *
- * @param name - The slice identity.
- * @param theme - The resolved theme.
- * @returns The slice's color.
- */
-function sliceHue(name: SliceName, theme: Context["theme"]): RGBA {
-  if (name === "system") return theme.hue.accent[400]
-  if (name === "messages") return theme.hue.interactive[400]
-  if (name === "tools") return theme.hue.neutral[400]
-  return theme.text.faint
-}
-
-/**
- * Format a token count for display: `992`, `12.3k`, `1.2m`.
- *
- * @param n - The token count.
- * @returns The compact form.
- */
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}m`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
-  return `${n}`
-}
-
-/**
- * The tree connector of child `index` of `count`, in `tree`'s line style:
- * `├──` for all but the last child, `└──` for the last.
- *
- * @param index - The child's ordinal in its block.
- * @param count - How many children the block shows (including a `more` row).
- * @returns The connector and its trailing space.
- */
-function tee(index: number, count: number): string {
-  return index === count - 1 ? "└── " : "├── "
+/** The mini gauge's width at a box inner width: the box's slack, capped. */
+function listFillWidth(inner: number): number {
+  return Math.max(0, Math.min(LIST_FILL_WIDTH, inner - LIST_FIXED_WIDTH))
 }
 
 /**
@@ -221,152 +194,6 @@ function gaugeColor(f: number, theme: Context["theme"]): RGBA {
   if (f >= 0.85) return theme.text.feedback.warning.base
   if (f >= 0.7) return theme.hue.interactive[500]
   return theme.hue.accent[400]
-}
-
-/**
- * A slice of the selected record's prompt, ready for a bar row.
- */
-interface SliceView {
-  /** The slice identity. */
-  readonly name: SliceName
-  /** The slice's share of the prompt (0..1). */
-  readonly share: number
-  /** Estimated tokens, or null when no usage has landed. */
-  readonly tokens: number | null
-}
-
-/**
- * The slice views for a record: token share when usage is present, otherwise
- * rendered-byte share (the bars still show the composition's proportions).
- *
- * @param rec - The stored per-call record.
- * @returns The four slices in wire-body order, or empty when nothing can be shown.
- */
-function sliceViews(rec: CallView): SliceView[] {
-  const est = estimate(rec)
-  if (est.slices.length > 0) {
-    const total = est.slices.reduce((sum, s) => sum + s.rendered, 0)
-    return est.slices.map((s) => ({
-      name: s.name,
-      share: total > 0 ? s.rendered / total : 0,
-      tokens: s.tokens,
-    }))
-  }
-  const composition = rec.composition
-  const body = rec.overhead.bodyBytes
-  if (composition === null || body === null || body <= 0) return []
-  const parts: Array<[SliceName, number]> = [
-    ["system", Math.max(0, composition.totals.systemRendered)],
-    ["messages", Math.max(0, composition.totals.contentRendered)],
-    ["tools", Math.max(0, composition.totals.toolsRendered)],
-    ["scaffolding", Math.max(0, rec.overhead.delta ?? 0)],
-  ]
-  const total = parts.reduce((sum, [, bytes]) => sum + bytes, 0)
-  return parts.map(([name, bytes]) => ({ name, share: total > 0 ? bytes / total : 0, tokens: null }))
-}
-
-/**
- * One system instruction source as a sub-row of the system slice.
- */
-interface SourceView {
-  /** The source key, e.g. `core/skill-guidance`. */
-  readonly key: string
-  /** The source's share of the system slice (0..1). */
-  readonly share: number
-  /** Estimated tokens, or null when no usage has landed. */
-  readonly tokens: number | null
-}
-
-/**
- * The system sources of a record, largest first.
- *
- * @param rec - The stored per-call record.
- * @returns The per-source views, or empty when the composition has none.
- */
-function sourceViews(rec: CallView): SourceView[] {
-  const composition = rec.composition
-  if (composition === null || composition.totals.systemRendered <= 0) return []
-  const system = estimate(rec).slices.find((s) => s.name === "system")
-  const sources = composition.system.flatMap((part) => part.sources ?? [])
-  const views = sources.map((source) => ({
-    key: source.key,
-    share: source.rendered / composition.totals.systemRendered,
-    tokens: system !== undefined && system.tokens !== null ? Math.round(system.tokens * (source.rendered / composition.totals.systemRendered)) : null,
-  }))
-  return views.sort((a, b) => b.share - a.share)
-}
-
-/**
- * One message part-type aggregate for the detail's messages sub-row.
- */
-interface PartTypeView {
-  /** The part type, e.g. `tool-call`. */
-  readonly type: string
-  /** How many parts of this type. */
-  readonly count: number
-  /** The type's share of the messages slice (0..1), by rendered bytes. */
-  readonly share: number
-  /** Estimated tokens, or null when no usage has landed. */
-  readonly tokens: number | null
-}
-
-/**
- * The message part-type aggregates of a record, largest first.
- *
- * @param rec - The stored per-call record.
- * @returns The per-type views, or empty when the composition has no messages.
- */
-function partTypeViews(rec: CallView): PartTypeView[] {
-  const composition = rec.composition
-  if (composition === null || composition.totals.contentRendered <= 0) return []
-  const messages = estimate(rec).slices.find((s) => s.name === "messages")
-  const grouped = new Map<string, { count: number; rendered: number }>()
-  for (const message of composition.messages) {
-    for (const part of message.parts) {
-      const entry = grouped.get(part.type) ?? { count: 0, rendered: 0 }
-      entry.count += 1
-      entry.rendered += part.rendered
-      grouped.set(part.type, entry)
-    }
-  }
-  const content = composition.totals.contentRendered
-  const views = Array.from(grouped.entries()).map(([type, entry]) => ({
-    type,
-    count: entry.count,
-    share: content > 0 ? entry.rendered / content : 0,
-    tokens: messages !== undefined && messages.tokens !== null ? Math.round(messages.tokens * (entry.rendered / content)) : null,
-  }))
-  return views.sort((a, b) => (b.tokens ?? -1) - (a.tokens ?? -1))
-}
-
-/**
- * A one-line status for a record that is not a fully answered primary call.
- *
- * @param rec - The stored per-call record.
- * @param warning - The theme's warning color.
- * @param info - The theme's info color.
- * @param error - The theme's error color.
- * @returns The status line, or null when the record is complete.
- */
-function statusLine(
-  rec: CallView,
-  warning: RGBA,
-  info: RGBA,
-  error: RGBA,
-): { text: string; color: RGBA } | null {
-  if (rec.orphan === true) {
-    return { text: "no response received (orphaned request)", color: warning }
-  }
-  if (rec.response === null) {
-    return { text: "awaiting response…", color: info }
-  }
-  if (rec.response.status >= 400) {
-    return { text: `provider error ${rec.response.status}`, color: error }
-  }
-  if (rec.tokens === null) {
-    return { text: "no usage reported", color: warning }
-  }
-  return null
 }
 
 /**
@@ -499,24 +326,30 @@ function Panel(props: { context: Context; panel: PanelInput }) {
     return i < 0 ? undefined : records()[i]
   })
 
-  // The context window for gauges: the selected model's registered limit,
-  // falling back to the largest prompt observed in the session.
-  const windowSize = createMemo(() => {
+  // The context window for the selected record's model: the model's registered
+  // limit (a true window), falling back to the largest prompt observed in the
+  // session (a scale, not a window — `known` is false, and the context box
+  // renders the request at full scale rather than a bogus free space).
+  const windowFor = createMemo((): { size: number; known: boolean } | undefined => {
     const rec = current()
     if (rec !== undefined) {
       const models = context.data.location.model.list(location()) ?? []
       const info = models.find(
         (model) => model.providerID === rec.model.providerID && model.modelID === rec.model.id,
       )
-      if (info !== undefined) return info.limit.context
+      if (info !== undefined && info.limit.context > 0) {
+        return { size: info.limit.context, known: true }
+      }
     }
     let max = 0
     for (const rec of records()) {
       const prompt = estimate(rec).prompt
       if (prompt !== null && prompt > max) max = prompt
     }
-    return max > 0 ? max : undefined
+    return max > 0 ? { size: max, known: false } : undefined
   })
+
+  const windowSize = createMemo(() => windowFor()?.size)
 
   /**
    * The selected record's fill of the context window, or null when unknown.
@@ -536,54 +369,72 @@ function Panel(props: { context: Context; panel: PanelInput }) {
     return rec === undefined ? "" : `${rec.model.providerID}/${rec.model.id}`
   })
 
-  /**
-   * How many rows the context detail renders for the selected record: the
-   * gauge row, the bar (or its no-composition stand-in), a breathing line,
-   * one legend row per slice plus the slice's breakdown tree, a breathing
-   * line, and the status and completion rows when present. The context box
-   * is sized from this — content height plus the border — so the detail is
-   * fully visible whenever the terminal can hold it and scrolls only when it
-   * cannot. It must mirror the detail's branches exactly, or the box's height
-   * would not match its content.
-   */
-  const detailRows = createMemo(() => {
-    const rec = current()
-    if (rec === undefined) return 3
-    let rows = 3 // gauge + bar + breathing line
-    for (const slice of sliceViews(rec)) {
-      rows += 1 // the slice's legend row
-      const entries = breakdownRows(slice.name, rec)
-      if (entries !== null) {
-        rows += Math.min(entries.length, SUB_MAX_ROWS)
-        if (entries.length > SUB_MAX_ROWS) rows += 1
-      }
-    }
-    rows += 1 // breathing line before the response figures
-    if (
-      statusLine(
-        rec,
-        theme.text.feedback.warning.base,
-        theme.text.feedback.info.base,
-        theme.text.feedback.error.base,
-      ) !== null
-    )
-      rows += 1
-    if (estimate(rec).completion !== null) rows += 1
-    return rows
-  })
-
   // --- layout
 
   const width = () => props.panel.width
   const docked = () => props.panel.presentation === "panel"
   /** The content width inside the panel's left/right padding. */
   const contentWidth = () => Math.max(0, width() - 2)
-  /**
-   * The composition bar's width: at most `BAR_WIDTH`, but reserving the cells
-   * the frame and the trailing prompt figure need, so the value always fits
-   * the line.
-   */
-  const barWidth = createMemo(() => Math.max(8, Math.min(BAR_WIDTH, contentWidth() - 11)))
+  /** The context box's content width inside its frame and padding. */
+  const innerWidth = () => Math.max(0, contentWidth() - 4)
+
+  // The auto-compact reserve: the compaction setting's buffer, resolved
+  // against the window. OpenCode's documented default (15%, floored at 16k)
+  // applies when the setting is absent; `auto: false` releases the reserve,
+  // and it renders as free, because no compaction is scheduled to consume it.
+  // The fetch is one-way — a config change mid-session needs a panel reopen.
+  const [compactionConfig, setCompactionConfig] = createSignal<CompactionConfig | null>(null)
+  let configGeneration = 0
+  createEffect(() => {
+    const loc = location()
+    const generation = ++configGeneration
+    void client
+      .config.get(loc !== undefined ? { location: loc } : undefined)
+      .then(
+        (entries) => {
+          if (generation === configGeneration) setCompactionConfig(parseCompaction(entries))
+        },
+        () => {
+          // The config is unreadable (the service restarted mid-session): the
+          // documented default applies rather than hiding the reserve.
+          if (generation === configGeneration) setCompactionConfig(null)
+        },
+      )
+  })
+  onCleanup(() => {
+    configGeneration += 1
+  })
+
+  const bufferTokens = createMemo(() => {
+    const window = windowSize()
+    if (window === undefined || window <= 0) return 0
+    const fallback = Math.max(BUFFER_MIN, Math.round(BUFFER_DEFAULT_SHARE * window))
+    const config = compactionConfig()
+    if (config === null) return fallback
+    if (config.auto === false) return 0
+    if (config.pct !== null) return Math.round(config.pct * window)
+    if (config.tokens !== null) return Math.max(0, Math.min(window, config.tokens))
+    return fallback
+  })
+
+  // The context box's content for the selected record: the window grid, its
+  // figure line, the composition legend, the system breakdown, the response
+  // line, and the unit footer. Pure over the panel's signals, so it recomputes
+  // on selection, records, window, buffer, width, and theme changes.
+  const detail = createMemo<ContextDetail | null>(() => {
+    const rec = current()
+    if (rec === undefined) return null
+    const window = windowFor()
+    return contextDetail(
+      rec,
+      records(),
+      window?.size,
+      window !== undefined && window.known,
+      bufferTokens(),
+      innerWidth(),
+      theme,
+    )
+  })
 
   // In fullscreen the session is hidden, so the panel is the only surface;
   // docked, it only owns keys while the host focuses it.
@@ -612,12 +463,17 @@ function Panel(props: { context: Context; panel: PanelInput }) {
 
   let list: ScrollBoxRenderable | null = null
 
-  // Keep the selected row in view.
-  createEffect(() => {
-    const i = selection()
-    if (i < 0 || list === null) return
-    list.scrollChildIntoView(`wc-row-${records()[i].seq}`, { align: "nearest" })
-  })
+  // Keep the selected row in view when the selection changes. Deferred: the
+  // first run would drag the whole-panel scroll to the (latest) selected row
+  // on open, hiding the context box — a fresh panel starts at the top.
+  on(
+    () => selection(),
+    (i) => {
+      if (i < 0 || list === null) return
+      list.scrollChildIntoView(`wc-row-${records()[i].seq}`, { align: "nearest" })
+    },
+    { defer: true },
+  )
 
   // --- keymap
 
@@ -697,25 +553,14 @@ function Panel(props: { context: Context; panel: PanelInput }) {
   /** The requests box's title figure: how many calls were captured. */
   const requestsSummary = createMemo(() => `${records().length} calls`)
 
-  const headerGauge = createMemo(() => {
-    const rec = current()
-    if (rec === undefined) return { cells: "·".repeat(GAUGE_CELLS), color: theme.text.faint, label: "" }
-    const f = fill(rec)
-    if (f === null) return { cells: "·".repeat(GAUGE_CELLS), color: theme.text.faint, label: "no usage yet" }
-    const filled = Math.min(GAUGE_CELLS, Math.round(f * GAUGE_CELLS))
-    const over = f > 1
-    const cells = "▇".repeat(filled) + (over ? "!" : "░".repeat(Math.max(0, GAUGE_CELLS - filled)))
-    return {
-      cells,
-      color: gaugeColor(f, theme),
-      label: over ? ">100%" : `${Math.round(f * 100)}%`,
-    }
-  })
-
   return (
+    // The host places this in the session.panel slot (a box that grows to
+    // fill its pane). Fill and shrink the same way, so the panel takes exactly
+    // the space the view gives it — no more, no less.
     <box
       width="100%"
-      height="100%"
+      flexGrow={1}
+      flexShrink={1}
       flexDirection="column"
       minWidth={0}
       minHeight={0}
@@ -724,13 +569,46 @@ function Panel(props: { context: Context; panel: PanelInput }) {
       paddingRight={1}
       paddingTop={1}
     >
-      {/* Body: three stacked btop-style boxes — the selected request's
-          composition (the box's border carries the model; its first row is
-          the window-fill gauge), the trend, and the request list. */}
+      {/* Panel header: the plugin's name left, the version right. The name
+          takes the slack (and truncates in a narrow pane), so the version
+          stays pinned to the edge. */}
+      <box flexDirection="row" width="100%" minWidth={0} minHeight={0} flexShrink={0}>
+        <text
+          fg={theme.text.faint}
+          wrapMode="none"
+          truncate
+          flexGrow={1}
+          flexShrink={1}
+          minWidth={0}
+          minHeight={0}
+          selectable={false}
+        >
+          {"opencode-what-context"}
+        </text>
+        <text
+          fg={theme.text.faint}
+          wrapMode="none"
+          truncate
+          flexShrink={0}
+          minWidth={0}
+          minHeight={0}
+          selectable={false}
+        >
+          {`v${VERSION}`}
+        </text>
+      </box>
+
+      {/* Body: three stacked boxes — the selected request's composition
+          (the box's border carries the model; its first row is the
+          window-fill gauge), the trend, and the request list. The whole
+          body scrolls as one: the boxes stack at their natural heights and
+          the scrollbox (which fills and shrinks with the slot) carries the
+          overflow, so a short view never crushes a box and a long one —
+          the 200-record request list above all — stays reachable. */}
       <Show
         when={error() === null && records().length > 0}
         fallback={
-          <box flexGrow={1} minHeight={0} alignItems="center" justifyContent="center">
+          <box flexGrow={1} flexShrink={1} minHeight={0} minWidth={0} alignItems="center" justifyContent="center">
             <Show
               when={error() === null}
               fallback={
@@ -746,184 +624,148 @@ function Panel(props: { context: Context; panel: PanelInput }) {
           </box>
         }
       >
-        <box flexDirection="column" flexGrow={1} minHeight={0} minWidth={0} gap={0}>
-          {/* Context: the selected request's composition, in a btop-style box.
-              The border carries the model (the box's only label — a bare
-              "context" would say nothing the panel does not), and the detail
-              is keyed — the callback re-runs whenever the selected record's
-              identity changes. The box is content-sized: its height is the
-              detail's row count, so every row is visible whenever the
-              terminal can hold it; only when it cannot does the box shrink
-              (never below the gauge and the bar) and the scrollbox clip the
-              overflow into a scrolled view. The scrollbox's flex basis is
-              zeroed — left to auto, a scrollbox reports its content height to
-              the column, and a 200-record list would starve this box. */}
-          <box
-            border
-            borderStyle="rounded"
-            borderColor={theme.text.faint}
-            title={boxTitle(modelLabel() || "context", contentWidth(), "")}
-            titleColor={theme.text.muted}
-            paddingLeft={1}
-            paddingRight={1}
-            height={detailRows() + 2}
-            flexGrow={0}
-            flexShrink={1}
-            minHeight={6}
-            minWidth={0}
-          >
-            <scrollbox
-              scrollY
-              flexGrow={1}
-              flexBasis={0}
-              width="100%"
-              minHeight={0}
+        <scrollbox
+          ref={(value) => {
+            list = value
+          }}
+          scrollY
+          flexGrow={1}
+          flexShrink={1}
+          // Zero basis: a scrollbox left to auto reports its content height
+          // to the column, and a 200-record list would push the header off
+          // the pane. With a zero basis it takes exactly the space the slot
+          // leaves below the header, and scrolls when the boxes are taller.
+          flexBasis={0}
+          width="100%"
+          minHeight={0}
+          minWidth={0}
+        >
+          <box flexDirection="column" width="100%" minWidth={0} gap={0}>
+            {/* Context: the selected request's window, in a btop-style box.
+                The border carries the model (the box's only label — a bare
+                "context" would say nothing the panel does not), and the
+                detail is keyed — the callback re-runs whenever the selected
+                record's identity changes. The box is content-sized: it stacks
+                inside the panel scroll at exactly the height its rows need. */}
+            <box
+              border
+              borderStyle="rounded"
+              borderColor={theme.text.faint}
+              title={boxTitle(modelLabel() !== "" ? `Context · ${modelLabel()}` : "Context", contentWidth(), "")}
+              titleColor={theme.text.muted}
+              paddingLeft={1}
+              paddingRight={1}
               minWidth={0}
             >
               <Show when={current()} keyed>
-              {(rec) => {
-                const slices = sliceViews(rec)
-                const status = statusLine(rec, theme.text.feedback.warning.base, theme.text.feedback.info.base, theme.text.feedback.error.base)
-                const est = estimate(rec)
-                const toolCount = rec.composition?.tools.length ?? 0
-                const prompt = est.prompt
-                const completion = est.completion
-                const cacheRead = est.cacheRead
-                const cacheHit = prompt !== null && prompt > 0 && cacheRead !== null ? cacheRead / prompt : 0
-                return (
-                  <box flexDirection="column" minWidth={0} flexShrink={0}>
-                    {/* Window fill of this request, in the shape of the footer
-                        indicator: the density gauge, its percentage, and the
-                        free space (or the overrun). The footer shows the
-                        session's latest step; this shows the selected one.
-                        Bold and colored where the terminal has color; the
-                        gauge shape carries the fill in mono. */}
-                    {(() => {
-                      const gauge = headerGauge()
-                      const label = gauge.label === "" ? "no usage yet" : gauge.label
-                      return (
-                        <text wrapMode="none" truncate selectable={false}>
-                          <span style={{ fg: gauge.color, bold: true }}>{gauge.cells}</span>
-                          {label === "no usage yet" ? (
-                            <span style={{ fg: theme.text.faint }}>{` no usage yet`}</span>
-                          ) : (
+                  {(rec) => {
+                    // The detail is a memo over the selected record (and the
+                    // window, buffer, width, and theme); the keyed callback only
+                    // re-runs on record identity changes, and the memo's own
+                    // dependencies keep every row live. It can only be null when
+                    // the record itself vanished, which `when` rules out.
+                    const d = detail()
+                    if (d === null) return <box flexDirection="column" width="100%" minWidth={0} />
+                    const spanFg = (span: DetailSpan): RGBA => spanColor(span, theme)
+                    return (
+                      <box flexDirection="column" width="100%" minWidth={0} flexShrink={0}>
+                      {/* Usage: the window grid, filled in reading order — the
+                          used slices, then free space, then the reserve. */}
+                      <text fg={theme.text.base} wrapMode="none" truncate selectable={false}>
+                        {`Usage:`}
+                      </text>
+                      <For each={d.rows}>
+                        {(runs) => (
+                          <text wrapMode="none" truncate selectable={false}>
+                            {runs.map((run, i) => (
+                              <>
+                                {i > 0 ? " " : null}
+                                <span style={{ fg: run.fg }}>{run.text}</span>
+                              </>
+                            ))}
+                          </text>
+                        )}
+                      </For>
+                      {/* The figure line: the headline numbers the grid shows. */}
+                      <text wrapMode="none" truncate selectable={false}>
+                        {d.figure.map((span) => (
+                          <span style={{ fg: spanFg(span), bold: span.bold === true }}>{span.text}</span>
+                        ))}
+                      </text>
+                      {/* A breathing line between the usage and the legend. */}
+                      <box height={1} flexShrink={0} />
+                      {/* Composition: the dot-leader legend, one row per window
+                          category; the system row grows the source breakdown
+                          beneath it, the messages row the part-type breakdown
+                          (tree connectors, a `more` row for a hidden tail).
+                          Non-primary calls carry no composition at all. */}
+                      <text fg={theme.text.base} wrapMode="none" truncate selectable={false}>
+                        {`Composition:`}
+                      </text>
+                      {d.legend.length === 0 ? (
+                        <text fg={theme.text.muted} wrapMode="none" truncate selectable={false}>
+                          {`no composition captured`}
+                        </text>
+                      ) : (
+                        <For each={d.legend}>
+                          {(row, i) => (
                             <>
-                              <span style={{ fg: theme.text.base, bold: true }}>{` ${label}`}</span>
-                              {prompt !== null && windowSize() !== undefined && (() => {
-                                const window = windowSize()
-                                if (window === undefined) return null
-                                const free = window - prompt
-                                if (free < 0)
-                                  return (
-                                    <span style={{ fg: theme.text.feedback.error.base, bold: true }}>
-                                      {` over by ${formatTokens(-free)}`}
-                                    </span>
-                                  )
-                                return (
-                                  <span style={{ fg: gauge.color, bold: true }}>{` ${formatTokens(free)} free`}</span>
-                                )
-                              })()}
+                              <text wrapMode="none" truncate selectable={false}>
+                                <span style={{ fg: row.fg }}>{row.glyph}</span>
+                                <span style={{ fg: theme.text.muted }}>{` ${row.name}`}</span>
+                                <span style={{ fg: theme.text.faint }}>{row.leader}</span>
+                                <span style={{ fg: theme.text.base }}>{` ${row.value.padStart(6)}`}</span>
+                                {row.pct !== null && (
+                                  <span style={{ fg: theme.text.muted }}>{` ${row.pct}`}</span>
+                                )}
+                              </text>
+                              {/* The legend's first two rows (system, messages)
+                                  are the only slices with breakdowns; the rest
+                                  are leaves. */}
+                              <For
+                                each={i() === 0 ? d.subs.system : i() === 1 ? d.subs.messages : []}
+                              >
+                                {(sub) => (
+                                  <text wrapMode="none" truncate selectable={false}>
+                                    <span style={{ fg: theme.text.faint }}>{sub.tree}</span>
+                                    <span style={{ fg: theme.text.muted }}>{sub.name}</span>
+                                    <span style={{ fg: theme.text.faint }}>{sub.leader}</span>
+                                    <span style={{ fg: theme.text.base }}>{` ${sub.value.padStart(6)}`}</span>
+                                    {sub.pct !== null && (
+                                      <span style={{ fg: theme.text.muted }}>{` ${sub.pct}`}</span>
+                                    )}
+                                  </text>
+                                )}
+                              </For>
                             </>
                           )}
+                        </For>
+                      )}
+                      {/* A breathing line before the response figures. */}
+                      <box height={1} flexShrink={0} />
+                      <text fg={theme.text.base} wrapMode="none" truncate selectable={false}>
+                        {`Response:`}
+                      </text>
+                      {d.response !== null && (
+                        <text wrapMode="none" truncate selectable={false}>
+                          {d.response.map((span) => (
+                            <span style={{ fg: spanFg(span), bold: span.bold === true }}>{span.text}</span>
+                          ))}
                         </text>
-                      )
-                    })()}
-                    {/* The prompt as one stacked bar: segment width is share,
-                        block density is identity. Non-primary kinds carry no
-                        composition at all. */}
-                    {slices.length > 0 ? (
-                      <CompositionBar
-                        slices={slices}
-                        barWidth={barWidth()}
-                        value={prompt !== null ? formatTokens(prompt) : undefined}
-                        theme={theme}
-                      />
-                    ) : (
-                      <text fg={theme.text.faint} wrapMode="none" truncate selectable={false}>
-                        {`  ${rec.kind} call${
-                          prompt !== null ? ` — ${formatTokens(prompt)} prompt` : ""
-                        } — no composition captured`}
-                      </text>
-                    )}
-                    {/* A breathing line between the bar and the legend. */}
-                    <box height={1} flexShrink={0} />
-                    {/* Legend: one row per slice — the glyph ties each row to
-                        its segment of the bar; tokens and share carry the
-                        numbers. Slices with a breakdown (system sources,
-                        message parts) grow a tree of entries beneath their
-                        row: `├──` for all but the last child, `└──` for the
-                        last, and a `… +N more` row standing in for a hidden
-                        tail, so the tree never dangles. Tool names stay out
-                        of the panel — the tools slice is a leaf. */}
-                    <For each={slices}>
-                      {(slice) => {
-                        const entries = breakdownRows(slice.name, rec)
-                        const shown = entries !== null ? entries.slice(0, SUB_MAX_ROWS) : []
-                        const extra = entries !== null ? entries.length - shown.length : 0
-                        const children = shown.length + (extra > 0 ? 1 : 0)
-                        return (
-                          <>
-                            <text wrapMode="none" truncate selectable={false}>
-                              <span style={{ fg: sliceHue(slice.name, theme) }}>{SLICE_GLYPH[slice.name]}</span>
-                              <span style={{ fg: theme.text.muted }}>{` ${slice.name}`.padEnd(13)}</span>
-                              <span style={{ fg: theme.text.base }}>
-                                {slice.tokens === null ? "·····" : formatTokens(slice.tokens).padStart(6)}
-                              </span>
-                              <span style={{ fg: theme.text.muted }}>
-                                {` ${Math.round(slice.share * 100)}%${slice.name === "tools" ? ` (${toolCount})` : ""}`}
-                              </span>
-                            </text>
-                            <For each={shown}>
-                              {(row, index) => (
-                                <text wrapMode="none" truncate selectable={false}>
-                                  <span style={{ fg: theme.text.faint }}>{tee(index(), children)}</span>
-                                  <span style={{ fg: theme.text.muted }}>
-                                    {row.name.slice(0, SUB_NAME_WIDTH).padEnd(SUB_NAME_WIDTH)}
-                                  </span>
-                                  <span style={{ fg: theme.text.base }}>
-                                    {row.tokens === null ? "·····" : formatTokens(row.tokens).padStart(6)}
-                                  </span>
-                                  <span style={{ fg: theme.text.muted }}>{` ${Math.round(row.share * 100)}%`}</span>
-                                </text>
-                              )}
-                            </For>
-                            {extra > 0 && (
-                              <text wrapMode="none" truncate selectable={false}>
-                                <span style={{ fg: theme.text.faint }}>└── </span>
-                                <span style={{ fg: theme.text.muted }}>{`… +${extra} more`}</span>
-                              </text>
-                            )}
-                          </>
-                        )
-                      }}
-                    </For>
-                    {/* A breathing line before the call's response figures. */}
-                    <box height={1} flexShrink={0} />
-                    {status !== null && (
-                      <text fg={status.color} attributes={TextAttributes.BOLD} wrapMode="none" truncate selectable={false}>
-                        {status.text}
-                      </text>
-                    )}
-                    {/* The call's other side: the bar's row carries the prompt
-                        figure, so this row is completion and the cache it read. */}
-                    {completion !== null && (
-                      <text wrapMode="none" truncate selectable={false}>
-                        <span style={{ fg: theme.text.base, bold: true }}>
-                          {`${formatTokens(completion)} completion`}
-                        </span>
-                        {cacheRead !== null && cacheRead > 0 && (
-                          <span style={{ fg: theme.text.muted }}>
-                            {` · ${formatTokens(cacheRead)} cache (${Math.round(cacheHit * 100)}%)`}
-                          </span>
-                        )}
-                      </text>
-                    )}
-                  </box>
-                )
-              }}
-            </Show>
-            </scrollbox>
-          </box>
+                      )}
+                      {d.footer !== null && (
+                        <>
+                          <box height={1} flexShrink={0} />
+                          <text fg={theme.text.faint} wrapMode="none" truncate selectable={false}>
+                            {d.footer}
+                          </text>
+                        </>
+                      )}
+                    </box>
+                  )
+                }}
+              </Show>
+            </box>
 
           {/* Trend: one cell per request, latest at the right — the box's
               border carries the window figure (the curve's scale label), so
@@ -984,11 +826,11 @@ function Panel(props: { context: Context; panel: PanelInput }) {
           </box>
 
           {/* Requests: the session's calls, oldest at the top, in a box that
-              grows to fill the panel. The frame is the native border, which
-              follows the scrolling list's height; a header row names the
-              columns, and every column is fixed width — seq, kind,
-              right-aligned tokens, mini gauge — so the columns stay aligned
-              whether a figure is present or a placeholder. */}
+              stacks at its natural height in the panel scroll. The frame is
+              the native border; a header row names the columns, and every
+              column is fixed width — seq, kind, right-aligned tokens, mini
+              gauge — so the columns stay aligned whether a figure is present
+              or a placeholder. */}
           <box
             border
             borderStyle="rounded"
@@ -997,33 +839,17 @@ function Panel(props: { context: Context; panel: PanelInput }) {
             titleColor={theme.text.muted}
             paddingLeft={1}
             paddingRight={1}
-            flexGrow={1}
-            // The context box is the shrinkable one; the list keeps a floor of
-            // header plus a few rows so a short terminal never leaves it an
-            // empty frame.
-            minHeight={7}
             minWidth={0}
           >
-            <box flexDirection="column" flexGrow={1} minHeight={5} minWidth={0}>
+            <box flexDirection="column" width="100%" minWidth={0}>
               <text fg={theme.text.faint} wrapMode="none" truncate flexShrink={0} minWidth={0} selectable={false}>
-                {LIST_HEADER}
+                {listHeader(listFillWidth(innerWidth()))}
               </text>
-              <scrollbox
-                ref={(value) => {
-                  list = value
-                }}
-                scrollY
-                flexGrow={1}
-                // Zero basis: left to auto, a scrollbox reports its content
-                // height to the column, and a long record list would create a
-                // phantom overflow that starves the content-sized context box
-                // above it.
-                flexBasis={0}
+              <box
+                flexDirection="column"
                 width="100%"
-                minHeight={0}
                 minWidth={0}
               >
-                <box flexDirection="column" minWidth={0}>
                   <For each={records()}>
                     {(rec, index) => {
                       const selectedHere = index() === selection()
@@ -1037,12 +863,15 @@ function Panel(props: { context: Context; panel: PanelInput }) {
                               ? "title"
                               : rec.kind.slice(0, 7)
                       const prompt = estimate(rec).prompt
-                      const filled =
-                        f === null ? 0 : Math.min(LIST_FILL_WIDTH, Math.round(f * LIST_FILL_WIDTH))
+                      // The gauge takes whatever the box's inner width leaves
+                      // past the fixed columns, so a narrow panel shrinks the
+                      // gauge instead of truncating the row.
+                      const fillW = listFillWidth(innerWidth())
+                      const filled = f === null ? 0 : Math.min(fillW, Math.round(f * fillW))
                       const mini =
                         f === null
-                          ? "·".repeat(LIST_FILL_WIDTH)
-                          : "▇".repeat(filled) + "░".repeat(LIST_FILL_WIDTH - filled)
+                          ? "·".repeat(fillW)
+                          : "▇".repeat(filled) + "░".repeat(fillW - filled)
                       // The selected row takes base + bold (and the raised
                       // surface); non-primary kinds recede to faint so the
                       // primary calls read as the list's spine. The mini gauge
@@ -1077,11 +906,11 @@ function Panel(props: { context: Context; panel: PanelInput }) {
                       )
                     }}
                   </For>
-                </box>
-              </scrollbox>
+              </box>
             </box>
           </box>
         </box>
+        </scrollbox>
       </Show>
 
       {/* Footer: key help. */}
@@ -1091,94 +920,6 @@ function Panel(props: { context: Context; panel: PanelInput }) {
         </text>
       </box>
     </box>
-  )
-}
-
-/** One row of a breakdown sub-block, formatted for the block's shared columns. */
-interface SubRow {
-  /** The row's label: a source key, part type, tool name, or agent name. */
-  readonly name: string
-  /** Estimated tokens, or null when no usage has landed. */
-  readonly tokens: number | null
-  /** The row's share of its slice (0..1). */
-  readonly share: number
-}
-
-/**
- * The breakdown tree that hangs beneath a slice's legend row: the record's
- * system sources under `system`, its message part types under `messages`.
- * Every other slice — tools among them, per the panel's no-tool-names rule —
- * is a leaf.
- *
- * @param name - The slice the row would break down.
- * @param rec - The stored per-call record.
- * @returns The entries, largest first, or null when the slice has none.
- */
-function breakdownRows(name: SliceName, rec: CallView): SubRow[] | null {
-  if (name === "system") {
-    const sources = sourceViews(rec)
-    if (sources.length === 0) return null
-    return sources.map((s) => ({ name: s.key, tokens: s.tokens, share: s.share }))
-  }
-  if (name === "messages") {
-    const parts = partTypeViews(rec)
-    if (parts.length === 0) return null
-    return parts.map((p) => ({ name: `${p.type} (${p.count})`, tokens: p.tokens, share: p.share }))
-  }
-  return null
-}
-
-/**
- * The prompt of one request as a single stacked bar: each segment spans its
- * share of the prompt's rendered bytes, and each slice's block glyph marks its
- * identity. The four block densities separate the slices on any theme; the
- * house hues color them where the terminal has color. The prompt total
- * follows the bar's end — btop never draws a bar without its value beside it.
- *
- * @param props - The row's data, and the prompt figure the bar measures.
- * @returns The stacked bar row.
- */
-function CompositionBar(props: {
-  slices: SliceView[]
-  barWidth: number
-  value?: string
-  theme: Context["theme"]
-}) {
-  const { theme } = props
-  const width = props.barWidth
-  const cells: { char: string; fg: RGBA }[] = []
-  if (width <= 0 || props.slices.length === 0) {
-    return (
-      <text wrapMode="none" truncate selectable={false}>
-        {""}
-      </text>
-    )
-  }
-  for (let i = 0; i < width; i++) {
-    const pos = (i + 0.5) / width
-    let slice = props.slices[props.slices.length - 1]
-    let end = 0
-    for (const s of props.slices) {
-      end += s.share
-      if (pos <= end) {
-        slice = s
-        break
-      }
-    }
-    // Shares can sum to less than one when the wire body is partly unaccounted
-    // for; the uncovered tail is track, not scaffolding.
-    if (pos > end) cells.push({ char: "·", fg: theme.text.faint })
-    else cells.push({ char: SLICE_GLYPH[slice.name], fg: sliceHue(slice.name, theme) })
-  }
-  return (
-    <text wrapMode="none" truncate selectable={false}>
-      {cells.map((cell) => (
-        <span style={{ fg: cell.fg }}>{cell.char}</span>
-      ))}
-      {props.value !== undefined && (
-        <span style={{ fg: theme.text.base, bold: true }}>{` ${props.value}`}</span>
-      )}
-    </text>
   )
 }
 

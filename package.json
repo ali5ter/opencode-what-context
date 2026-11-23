@@ -1,6 +1,6 @@
 {
   "name": "opencode-what-context",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "An OpenCode plugin that shows what was sent to the model, request by request.",
   "type": "module",
   "exports": {
