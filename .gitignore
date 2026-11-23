@@ -13,3 +13,7 @@ dist/
 
 # Reference tokenizer download (research, part B of scripts/measure.ts)
 .tokenizer-cache/
+
+# OS and tooling residue
+.DS_Store
+__pycache__/
