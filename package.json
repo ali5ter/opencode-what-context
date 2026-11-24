@@ -1,19 +1,22 @@
 {
   "name": "opencode-what-context",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "An OpenCode plugin that shows what was sent to the model, request by request.",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
-    "./tui": "./src/tui.tsx",
-    "./rpc": "./src/rpc.ts"
+    ".": "./dist/index.js",
+    "./tui": "./dist/tui.js",
+    "./rpc": "./dist/rpc.js"
   },
   "files": [
+    "dist",
     "src",
     "tsconfig.json"
   ],
   "scripts": {
-    "check": "tsc --noEmit"
+    "build": "node scripts/build.mjs",
+    "check": "tsc --noEmit",
+    "prepack": "node scripts/build.mjs"
   },
   "dependencies": {
     "@opencode/client": "2.3.0",

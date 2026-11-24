@@ -81,6 +81,13 @@ The loader in `.opencode/plugins/` is generated, not tracked: OpenCode discovers
 automatically, so a session started in the repo runs the checkout's `src/` live (a running
 service reloads it on save).
 
+The published package ships the solid transform pre-applied: `npm run build` compiles `src/`
+to `dist/` with the host's own transform (imported from `@opentui/solid`), and `exports`
+points at `dist/`. This is load-bearing — the host applies the solid transform only to files
+outside `node_modules`, and a package installed into OpenCode's npm cache lives inside one;
+shipped raw, the JSX would compile to value props and the panel would render once, empty,
+and never update. `dist/` is gitignored and rebuilt at publish time by `prepack`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

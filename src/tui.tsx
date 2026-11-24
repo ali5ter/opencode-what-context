@@ -67,7 +67,57 @@ import {
 const NAME = "what-context"
 
 /** The plugin's version, shown in the panel header. Keep in sync with package.json. */
-const VERSION = "0.3.1"
+const VERSION = "0.3.2"
+
+/**
+ * Load-time tripwire. The solid transform that makes this file reactive is
+ * applied by the host only to files outside `node_modules`, and a package
+ * installed into OpenCode's npm cache lives inside one: without the
+ * transform, the JSX compiles to *value* props and solid's `Show` latches
+ * its first result, so the panel renders once (empty) and never updates
+ * again, with no error anywhere. That is the silent failure behind the
+ * empty-panel reports on package installs. Since 0.3.2 the package ships
+ * the transform pre-applied (`dist/`, built by `scripts/build.mjs`), so
+ * this canary should never trip; if a future load path ever flattens the
+ * props again, it says so out loud instead of freezing silently.
+ */
+const [transformMissing, setTransformMissing] = createSignal(false)
+
+/** A source signal the canary's prop binds to; the shape check is one-shot. */
+const [canaryTick] = createSignal(0)
+
+/**
+ * The canary behind the tripwire above. Its prop is bound to a signal, so
+ * compiled *with* the solid transform it arrives as a getter (read lazily,
+ * reactivity intact) and compiled *without* it (Bun's default JSX) it
+ * arrives as a value captured at render time. Rendered in the app slot at
+ * TUI start, it returns nothing visible.
+ *
+ * @param props - The canary prop.
+ * @returns Nothing.
+ */
+function TransformCanary(props: { probe: number }) {
+  void props.probe
+  if (!transformMissing() && Object.getOwnPropertyDescriptor(props, "probe")?.get === undefined) {
+    setTransformMissing(true)
+    console.error(
+      "[opencode-what-context] the solid reactivity transform was not applied: props " +
+        `arrived as values, not getters. The panel will render once and never update. ` +
+        `Load a 0.3.2+ install (pre-compiled dist) or run the dev shim (scripts/dev-link.sh).`,
+    )
+  }
+  return null
+}
+
+/** One line for the footer slot while the tripwire is tripped. */
+function TransformWarning(props: { context: Context }) {
+  const theme = props.context.theme
+  return (
+    <text fg={theme.text.feedback.error.base} wrapMode="none" truncate selectable={false}>
+      {"⚠ what-context: reactivity transform missing — panel frozen (see log)"}
+    </text>
+  )
+}
 
 /** The prompt-footer indicator's gauge width in cells. */
 const FOOTER_GAUGE_CELLS = 10
@@ -1034,7 +1084,9 @@ function Commands(props: { context: Context }) {
       },
     ],
   }))
-  return null
+  // The tripwire canary: the app slot is mounted for the whole TUI, so it
+  // fires at start — before the panel or the footer can mislead.
+  return <TransformCanary probe={canaryTick()} />
 }
 
 export default Plugin.define({
@@ -1043,7 +1095,7 @@ export default Plugin.define({
     context.ui.slot({
       append: "session.panel",
       render: (panel) => (
-        <Show when={panel.name === NAME}>
+        <Show when={panel.name === NAME && !transformMissing()} fallback={<TransformWarning context={context} />}>
           <Panel context={context} panel={panel} />
         </Show>
       ),
@@ -1054,7 +1106,10 @@ export default Plugin.define({
     })
     context.ui.slot({
       append: "prompt.footer.status",
-      render: (input) => <StatusIndicator context={context} input={input} />,
+      // The tripwire surface: while it is tripped the footer shows a warning
+      // line instead of the indicator (the indicator's own gate would latch).
+      render: (input) =>
+        transformMissing() ? <TransformWarning context={context} /> : <StatusIndicator context={context} input={input} />,
     })
   },
 })
